@@ -1,6 +1,6 @@
 import http from "http";
 import https from "https";
-import { mkdirSync, readdirSync, statSync, unlinkSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from "fs";
 import { extname, join } from "path";
 
 const IMAGE_CACHE_MAX_AGE_MS = 60 * 60 * 1000;
@@ -16,6 +16,12 @@ function safeExtFromUrl(url: string): string {
 
 function toForwardSlashPath(input: string): string {
   return input.replace(/\\/g, "/");
+}
+
+function toFileUri(localPath: string): string {
+  const normalized = toForwardSlashPath(localPath);
+  if (normalized.startsWith("file://")) return normalized;
+  return `file://${normalized}`;
 }
 
 function downloadUrl(url: string): Promise<Buffer> {
@@ -70,6 +76,17 @@ function writeBufferToCache(cacheDir: string, ext: string, buf: Buffer): string 
   return toForwardSlashPath(filePath);
 }
 
+function cacheLocalFileForNapCat(localPath: string, cacheDir: string): string {
+  const normalized = toForwardSlashPath(localPath.startsWith("file://") ? localPath.slice("file://".length) : localPath);
+  if (!existsSync(normalized)) {
+    return toFileUri(normalized);
+  }
+
+  const buf = readFileSync(normalized);
+  const cachedPath = writeBufferToCache(cacheDir, safeExtFromUrl(normalized), buf);
+  return toFileUri(cachedPath);
+}
+
 export function cleanupImageCache(cacheDir: string): void {
   try {
     const files = readdirSync(cacheDir);
@@ -100,13 +117,13 @@ export async function resolveImageForNapCat(image: string, cacheDir: string): Pr
 
   if (/^https?:\/\//i.test(trimmed)) {
     const buf = await downloadUrl(trimmed);
-    return writeBufferToCache(cacheDir, safeExtFromUrl(trimmed), buf);
+    return toFileUri(writeBufferToCache(cacheDir, safeExtFromUrl(trimmed), buf));
   }
 
   if (trimmed.startsWith("base64://")) {
     const raw = trimmed.slice("base64://".length);
     const buf = Buffer.from(raw, "base64");
-    return writeBufferToCache(cacheDir, ".png", buf);
+    return toFileUri(writeBufferToCache(cacheDir, ".png", buf));
   }
 
   const dataUrlMatch = trimmed.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
@@ -122,12 +139,12 @@ export async function resolveImageForNapCat(image: string, cacheDir: string): Pr
       "image/webp": ".webp",
       "image/bmp": ".bmp",
     };
-    return writeBufferToCache(cacheDir, extMap[mime] || ".png", buf);
+    return toFileUri(writeBufferToCache(cacheDir, extMap[mime] || ".png", buf));
   }
 
-  if (trimmed.startsWith("file://")) {
-    return toForwardSlashPath(trimmed.slice("file://".length));
+  if (trimmed.startsWith("file://") || existsSync(trimmed)) {
+    return cacheLocalFileForNapCat(trimmed, cacheDir);
   }
 
-  return toForwardSlashPath(trimmed);
+  return toFileUri(trimmed);
 }
