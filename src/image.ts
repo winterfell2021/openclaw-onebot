@@ -6,6 +6,46 @@ import { extname, join } from "path";
 const IMAGE_CACHE_MAX_AGE_MS = 60 * 60 * 1000;
 const DOWNLOAD_TIMEOUT_MS = 30000;
 
+function detectImageType(buf: Buffer): string | null {
+  if (buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return "jpeg";
+  if (
+    buf.length >= 8 &&
+    buf[0] === 0x89 &&
+    buf[1] === 0x50 &&
+    buf[2] === 0x4e &&
+    buf[3] === 0x47 &&
+    buf[4] === 0x0d &&
+    buf[5] === 0x0a &&
+    buf[6] === 0x1a &&
+    buf[7] === 0x0a
+  ) {
+    return "png";
+  }
+  if (buf.length >= 6) {
+    const header = buf.subarray(0, 6).toString("ascii");
+    if (header === "GIF87a" || header === "GIF89a") return "gif";
+  }
+  if (
+    buf.length >= 12 &&
+    buf.subarray(0, 4).toString("ascii") === "RIFF" &&
+    buf.subarray(8, 12).toString("ascii") === "WEBP"
+  ) {
+    return "webp";
+  }
+  if (buf.length >= 2 && buf[0] === 0x42 && buf[1] === 0x4d) return "bmp";
+  return null;
+}
+
+function assertImageBuffer(buf: Buffer, source: string): void {
+  if (!buf.length) {
+    throw new Error(`图片内容为空: ${source}`);
+  }
+  const type = detectImageType(buf);
+  if (!type) {
+    throw new Error(`图片格式无效或损坏: ${source}`);
+  }
+}
+
 function safeExtFromUrl(url: string): string {
   const ext = extname(url.split("?")[0] || "").toLowerCase();
   if ([".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"].includes(ext)) {
@@ -83,6 +123,7 @@ function cacheLocalFileForNapCat(localPath: string, cacheDir: string): string {
   }
 
   const buf = readFileSync(normalized);
+  assertImageBuffer(buf, normalized);
   const cachedPath = writeBufferToCache(cacheDir, safeExtFromUrl(normalized), buf);
   return toFileUri(cachedPath);
 }
@@ -117,12 +158,14 @@ export async function resolveImageForNapCat(image: string, cacheDir: string): Pr
 
   if (/^https?:\/\//i.test(trimmed)) {
     const buf = await downloadUrl(trimmed);
+    assertImageBuffer(buf, trimmed);
     return toFileUri(writeBufferToCache(cacheDir, safeExtFromUrl(trimmed), buf));
   }
 
   if (trimmed.startsWith("base64://")) {
     const raw = trimmed.slice("base64://".length);
     const buf = Buffer.from(raw, "base64");
+    assertImageBuffer(buf, "base64://");
     return toFileUri(writeBufferToCache(cacheDir, ".png", buf));
   }
 
@@ -131,6 +174,7 @@ export async function resolveImageForNapCat(image: string, cacheDir: string): Pr
     const mime = dataUrlMatch[1].toLowerCase();
     const raw = dataUrlMatch[2];
     const buf = Buffer.from(raw, "base64");
+    assertImageBuffer(buf, "data-url");
     const extMap: Record<string, string> = {
       "image/jpeg": ".jpg",
       "image/jpg": ".jpg",

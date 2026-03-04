@@ -9,12 +9,15 @@ function fileUriToPath(uri: string): string {
   return uri.startsWith("file://") ? uri.slice("file://".length) : uri;
 }
 
+const TINY_PNG_BASE64 =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO6pQn0AAAAASUVORK5CYII=";
+
 describe("resolveImageForNapCat", () => {
   it("本地文件会复制到缓存目录并返回 file:// URI", async () => {
     const root = mkdtempSync(join(tmpdir(), "onebot-image-test-"));
     const srcFile = join(root, "input.jpg");
     const cacheDir = join(root, "cache");
-    writeFileSync(srcFile, Buffer.from("test-image-content"));
+    writeFileSync(srcFile, Buffer.from(TINY_PNG_BASE64, "base64"));
 
     try {
       const uri = await resolveImageForNapCat(srcFile, cacheDir);
@@ -36,6 +39,22 @@ describe("resolveImageForNapCat", () => {
     try {
       const uri = await resolveImageForNapCat(missingPath, cacheDir);
       assert.equal(uri, `file://${missingPath.replace(/\\\\/g, "/")}`);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("本地文件不是有效图片时应报错", async () => {
+    const root = mkdtempSync(join(tmpdir(), "onebot-image-invalid-"));
+    const srcFile = join(root, "broken.jpg");
+    const cacheDir = join(root, "cache");
+    writeFileSync(srcFile, Buffer.from("x"));
+
+    try {
+      await assert.rejects(
+        () => resolveImageForNapCat(srcFile, cacheDir),
+        /图片格式无效或损坏/,
+      );
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

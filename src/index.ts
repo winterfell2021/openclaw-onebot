@@ -236,11 +236,23 @@ function isMentioned(msg: OneBotMessage, selfId: number): boolean {
 let ws: WebSocket | null = null;
 let wsServer: import("ws").WebSocketServer | null = null;
 let httpServer: import("http").Server | null = null;
-const pendingEcho = new Map<string, { resolve: (v: any) => void }>();
+const pendingEcho = new Map<string, { resolve: (v: any) => void; reject: (err: Error) => void }>();
 let echoCounter = 0;
 
 function nextEcho(): string {
   return `onebot-${Date.now()}-${++echoCounter}`;
+}
+
+function oneBotActionError(action: string, resp: any): Error {
+  const code = typeof resp?.retcode === "number" ? resp.retcode : "unknown";
+  const detail = resp?.msg || resp?.message || resp?.wording || "";
+  return new Error(`OneBot action ${action} failed: retcode=${code}${detail ? ` ${detail}` : ""}`);
+}
+
+function isOneBotActionOk(resp: any): boolean {
+  if (typeof resp?.retcode === "number" && resp.retcode !== 0) return false;
+  if (typeof resp?.status === "string" && resp.status.toLowerCase() !== "ok") return false;
+  return true;
 }
 
 function sendOneBotAction(wsocket: WebSocket, action: string, params: Record<string, unknown>): Promise<any> {
@@ -257,8 +269,13 @@ function sendOneBotAction(wsocket: WebSocket, action: string, params: Record<str
       resolve: (v) => {
         clearTimeout(timeout);
         pendingEcho.delete(echo);
+        if (!isOneBotActionOk(v)) {
+          reject(oneBotActionError(action, v));
+          return;
+        }
         resolve(v);
       },
+      reject,
     });
 
     wsocket.send(JSON.stringify(payload), (err?: Error) => {
