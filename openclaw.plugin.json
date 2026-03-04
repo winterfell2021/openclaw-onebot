@@ -1,7 +1,7 @@
 {
   "id": "onebot",
   "name": "OneBot Channel",
-  "version": "1.1.0",
+  "version": "1.0.0",
   "description": "OneBot v11 protocol channel (QQ/Lagrange.Core via WebSocket)",
   "author": "Lagrange.Onebot",
   "channels": ["onebot"],
@@ -23,6 +23,31 @@
         "default": true,
         "description": "群聊是否必须 @ 机器人才回复"
       },
+      "thinkingEmojiEnabled": {
+        "type": "boolean",
+        "default": false,
+        "description": "是否在回复期间给用户消息添加临时表情回应（仅在支持 set_msg_emoji_like 的实现有效）"
+      },
+      "thinkingEmojiId": {
+        "type": "number",
+        "default": 60,
+        "description": "临时表情 ID（thinkingEmojiEnabled=true 时生效）"
+      },
+      "qqimgTagEnabled": {
+        "type": "boolean",
+        "default": true,
+        "description": "是否启用 <qqimg>...</qqimg> 图片标签解析"
+      },
+      "qqimgTagCloseVariants": {
+        "type": "array",
+        "description": "qqimg 标签允许的闭合形式，如 [\"qqimg\", \"img\"]",
+        "items": { "type": "string" },
+        "default": ["qqimg", "img"]
+      },
+      "imageCacheDir": {
+        "type": "string",
+        "description": "图片缓存目录（建议挂载到 OpenClaw 与 NapCat 共用路径）"
+      },
       "groupIncrease": {
         "type": "object",
         "properties": {
@@ -36,6 +61,10 @@
     "accessToken": { "label": "Access Token", "sensitive": true },
     "host": { "label": "主机地址", "placeholder": "127.0.0.1" },
     "port": { "label": "端口", "placeholder": "8080" },
-    "requireMention": { "label": "群聊需 @ 回复" }
+    "requireMention": { "label": "群聊需 @ 回复" },
+    "thinkingEmojiEnabled": { "label": "回复中表情提示" },
+    "thinkingEmojiId": { "label": "临时表情ID", "placeholder": "60" },
+    "qqimgTagEnabled": { "label": "启用<qqimg>标签" },
+    "imageCacheDir": { "label": "图片缓存目录", "placeholder": "/data/.openclaw/workspace/.onebot-image-cache" }
   }
 }

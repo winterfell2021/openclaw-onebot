@@ -81,6 +81,11 @@ export async function runOneBotSetup(): Promise<void> {
     ...(accessToken?.trim() ? { accessToken: String(accessToken).trim() } : {}),
     enabled: true,
     requireMention: true,
+    thinkingEmojiEnabled: false,
+    thinkingEmojiId: 60,
+    qqimgTagEnabled: true,
+    qqimgTagCloseVariants: ["qqimg", "img"],
+    imageCacheDir: "/data/.openclaw/workspace/.onebot-image-cache",
   };
 
   const next = { ...existing, channels };

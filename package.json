@@ -1,17 +1,20 @@
 {
-  "name": "openclaw-onebot",
-  "version": "1.1.0",
+  "name": "@winterfell2021/openclaw-onebot",
+  "version": "1.0.0",
   "description": "OneBot v11 protocol channel plugin for OpenClaw (QQ/Lagrange.Core/go-cqhttp)",
   "license": "MIT",
   "author": "LSTM-Kirigaya",
+  "publishConfig": {
+    "access": "public"
+  },
   "repository": {
     "type": "git",
-    "url": "https://github.com/LSTM-Kirigaya/openclaw-onebot.git"
+    "url": "https://github.com/winterfell2021/openclaw-onebot.git"
   },
   "bugs": {
-    "url": "https://github.com/LSTM-Kirigaya/openclaw-onebot/issues"
+    "url": "https://github.com/winterfell2021/openclaw-onebot/issues"
   },
-  "homepage": "https://github.com/LSTM-Kirigaya/openclaw-onebot#readme",
+  "homepage": "https://github.com/winterfell2021/openclaw-onebot#readme",
   "keywords": [
     "openclaw",
     "onebot",
@@ -25,13 +28,21 @@
   "exports": "./dist/index.js",
   "files": [
     "dist",
+    "src",
+    "scripts",
     "skills",
     "openclaw.plugin.json",
-    "README.md"
+    "README.md",
+    "LICENSE",
+    "tsconfig.json"
   ],
   "openclaw": {
-    "extensions": ["./dist/index.js"],
-    "skills": ["skills/onebot-ops"],
+    "extensions": [
+      "./dist/index.js"
+    ],
+    "skills": [
+      "skills/onebot-ops"
+    ],
     "channel": {
       "id": "onebot",
       "label": "OneBot",
@@ -39,31 +50,41 @@
       "docsPath": "/channels/onebot",
       "blurb": "OneBot v11 protocol via WebSocket (go-cqhttp, Lagrange.Core, etc.)",
       "order": 85,
-      "aliases": ["qq", "lagrange", "cqhttp"]
+      "aliases": [
+        "qq",
+        "lagrange",
+        "cqhttp"
+      ]
     }
   },
   "scripts": {
     "build": "tsc",
+    "test": "tsx --test tests/**/*.test.ts",
     "test:connect": "npx tsx scripts/test-connect.ts",
-    "prepublishOnly": "npm run build",
-    "pub": "npm run build && npm publish"
+    "prepublishOnly": "npm run test && npm run build",
+    "pub": "npm run test && npm run build && npm publish --access public"
   },
   "dependencies": {
-    "ws": "^8.17.0",
-    "@clack/prompts": "^1.0.0"
+    "@clack/prompts": "^1.0.0",
+    "ws": "^8.17.0"
   },
   "peerDependencies": {
-    "openclaw": "*",
-    "clawdbot": "*"
+    "clawdbot": "*",
+    "openclaw": "*"
   },
   "peerDependenciesMeta": {
-    "clawdbot": { "optional": true },
-    "openclaw": { "optional": true }
+    "clawdbot": {
+      "optional": true
+    },
+    "openclaw": {
+      "optional": true
+    }
   },
   "devDependencies": {
-    "typescript": "^5.4.0",
     "@types/node": "^22.0.0",
-    "tsx": "^4.0.0"
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.0.0",
+    "typescript": "^5.4.0"
   },
   "engines": {
     "node": ">=22"
