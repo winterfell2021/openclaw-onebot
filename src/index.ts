@@ -13,6 +13,7 @@ import { resolveOneBotRuntimeOptions, type OneBotRuntimeOptions } from "./option
 import { resolveUploadFileName, shouldFallbackToFileUpload, toExistingLocalPath } from "./image-fallback";
 import { parseQqimgSegments } from "./qqimg";
 import { resolveToolTargetByPolicy, type OneBotTarget } from "./target-policy";
+import { parseOneBotInboundMessage, resolveInboundMediaForPrompt } from "./inbound-media";
 
 // 尝试加载 plugin-sdk（兼容 openclaw 与 clawdbot）- 懒加载
 let sdkLoaded = false;
@@ -241,21 +242,6 @@ async function deliverTextWithQqimg(
       logger?.error?.(`[onebot] send ${item.type} failed: ${err?.message || err}`);
     }
   }
-}
-
-// ============ 从 OneBot 消息提取文本 ============
-
-function getRawText(msg: OneBotMessage): string {
-  if (!msg) return "";
-  if (typeof msg.raw_message === "string" && msg.raw_message) {
-    return msg.raw_message;
-  }
-  const arr = msg.message;
-  if (!Array.isArray(arr)) return "";
-  return arr
-    .filter((m) => m?.type === "text")
-    .map((m) => (m?.data as any)?.text ?? "")
-    .join("");
 }
 
 /** 检查群聊消息是否 @ 了机器人（self_id） */
@@ -544,8 +530,22 @@ async function processInboundMessage(api: any, msg: OneBotMessage): Promise<void
   }
 
   const cfg = api.config;
-  const messageText = getRawText(msg);
-  if (!messageText?.trim()) {
+  const runtimeOptions = resolveOneBotRuntimeOptions(cfg);
+  const parsedInbound = parseOneBotInboundMessage(msg);
+  const messageText = parsedInbound.text;
+  const inboundMedia = await resolveInboundMediaForPrompt(
+    parsedInbound.imageSources,
+    runtimeOptions.imageCacheDir,
+    api.logger,
+  );
+  const hasInboundMedia = inboundMedia.paths.length > 0;
+  if (parsedInbound.imageSources.length > 0) {
+    api.logger?.info?.(
+      `[onebot] inbound image parsed: sources=${parsedInbound.imageSources.length} resolved=${inboundMedia.paths.length}`,
+    );
+  }
+
+  if (!messageText?.trim() && !hasInboundMedia) {
     api.logger?.info?.(`[onebot] ignoring empty message`);
     return;
   }
@@ -633,6 +633,12 @@ async function processInboundMessage(api: any, msg: OneBotMessage): Promise<void
   const ctxPayload = {
     Body: body,
     RawBody: messageText,
+    MediaPath: hasInboundMedia ? inboundMedia.paths[0] : undefined,
+    MediaUrl: hasInboundMedia ? inboundMedia.urls[0] : undefined,
+    MediaType: hasInboundMedia ? inboundMedia.types[0] : undefined,
+    MediaPaths: hasInboundMedia ? inboundMedia.paths : undefined,
+    MediaUrls: hasInboundMedia ? inboundMedia.urls : undefined,
+    MediaTypes: hasInboundMedia ? inboundMedia.types : undefined,
     From: isGroup ? `onebot:group:${groupId}` : `onebot:${userId}`,
     To:
       currentTarget.type === "group"
@@ -675,8 +681,6 @@ async function processInboundMessage(api: any, msg: OneBotMessage): Promise<void
   if (runtime.channel.activity?.record) {
     runtime.channel.activity.record({ channel: "onebot", accountId: config.accountId ?? "default", direction: "inbound" });
   }
-
-  const runtimeOptions = resolveOneBotRuntimeOptions(cfg);
 
   const inboundMessageId = typeof msg.message_id === "number" ? msg.message_id : undefined;
   let emojiAdded = false;
