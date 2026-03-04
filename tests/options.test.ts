@@ -8,6 +8,9 @@ describe("resolveOneBotRuntimeOptions", () => {
     assert.equal(options.thinkingEmojiEnabled, false);
     assert.equal(options.qqimgTagEnabled, true);
     assert.equal(options.thinkingEmojiId, 60);
+    assert.equal(options.groupToolTargetPolicy, "force-current-group");
+    assert.equal(options.imageFailureFallback, "upload-file");
+    assert.equal(options.imageFailureFallbackNotice, false);
   });
 
   it("支持读取自定义配置", () => {
@@ -19,6 +22,9 @@ describe("resolveOneBotRuntimeOptions", () => {
           qqimgTagEnabled: false,
           qqimgTagCloseVariants: ["img"],
           imageCacheDir: "/tmp/abc",
+          groupToolTargetPolicy: "respect-target",
+          imageFailureFallback: "none",
+          imageFailureFallbackNotice: true,
         },
       },
     });
@@ -27,5 +33,8 @@ describe("resolveOneBotRuntimeOptions", () => {
     assert.equal(options.qqimgTagEnabled, false);
     assert.deepEqual(options.qqimgTagCloseVariants, ["img"]);
     assert.equal(options.imageCacheDir, "/tmp/abc");
+    assert.equal(options.groupToolTargetPolicy, "respect-target");
+    assert.equal(options.imageFailureFallback, "none");
+    assert.equal(options.imageFailureFallbackNotice, true);
   });
 });

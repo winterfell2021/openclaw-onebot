@@ -48,6 +48,23 @@
         "type": "string",
         "description": "图片缓存目录（建议挂载到 OpenClaw 与 NapCat 共用路径）"
       },
+      "groupToolTargetPolicy": {
+        "type": "string",
+        "enum": ["force-current-group", "respect-target"],
+        "default": "force-current-group",
+        "description": "群聊上下文中工具调用目标策略：强制当前群或按传入 target"
+      },
+      "imageFailureFallback": {
+        "type": "string",
+        "enum": ["none", "upload-file"],
+        "default": "upload-file",
+        "description": "图片发送失败后的兜底策略"
+      },
+      "imageFailureFallbackNotice": {
+        "type": "boolean",
+        "default": false,
+        "description": "图片发送失败后转文件上传时，是否额外发送提示文本"
+      },
       "groupIncrease": {
         "type": "object",
         "properties": {
@@ -65,6 +82,9 @@
     "thinkingEmojiEnabled": { "label": "回复中表情提示" },
     "thinkingEmojiId": { "label": "临时表情ID", "placeholder": "60" },
     "qqimgTagEnabled": { "label": "启用<qqimg>标签" },
-    "imageCacheDir": { "label": "图片缓存目录", "placeholder": "/data/.openclaw/workspace/.onebot-image-cache" }
+    "imageCacheDir": { "label": "图片缓存目录", "placeholder": "/data/.openclaw/workspace/.onebot-image-cache" },
+    "groupToolTargetPolicy": { "label": "群聊工具目标策略" },
+    "imageFailureFallback": { "label": "图片失败兜底策略" },
+    "imageFailureFallbackNotice": { "label": "转文件上传提示" }
   }
 }

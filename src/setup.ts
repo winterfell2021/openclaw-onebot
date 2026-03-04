@@ -86,6 +86,9 @@ export async function runOneBotSetup(): Promise<void> {
     qqimgTagEnabled: true,
     qqimgTagCloseVariants: ["qqimg", "img"],
     imageCacheDir: "/data/.openclaw/workspace/.onebot-image-cache",
+    groupToolTargetPolicy: "force-current-group",
+    imageFailureFallback: "upload-file",
+    imageFailureFallbackNotice: false,
   };
 
   const next = { ...existing, channels };

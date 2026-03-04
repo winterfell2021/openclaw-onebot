@@ -7,9 +7,12 @@
 
 import WebSocket from "ws";
 import { createServer } from "http";
+import { AsyncLocalStorage } from "async_hooks";
 import { cleanupImageCache, resolveImageForNapCat } from "./image";
 import { resolveOneBotRuntimeOptions, type OneBotRuntimeOptions } from "./options";
+import { resolveUploadFileName, shouldFallbackToFileUpload, toExistingLocalPath } from "./image-fallback";
 import { parseQqimgSegments } from "./qqimg";
+import { resolveToolTargetByPolicy, type OneBotTarget } from "./target-policy";
 
 // 尝试加载 plugin-sdk（兼容 openclaw 与 clawdbot）- 懒加载
 let sdkLoaded = false;
@@ -130,11 +133,6 @@ function listAccountIds(api: any): string[] {
   return [];
 }
 
-interface OneBotTarget {
-  type: "group" | "user";
-  id: number;
-}
-
 function parseOneBotTarget(input: string): OneBotTarget | null {
   const normalized = input.replace(/^onebot:/i, "").trim();
   if (!normalized) return null;
@@ -175,6 +173,43 @@ function stopImageCacheCleanupLoop(): void {
   if (!imageCacheCleanupTimer) return;
   clearInterval(imageCacheCleanupTimer);
   imageCacheCleanupTimer = null;
+}
+
+interface OneBotToolExecutionContext {
+  target: OneBotTarget | null;
+  sessionKey: string;
+  chatType: "group" | "direct";
+}
+
+const oneBotToolContextStorage = new AsyncLocalStorage<OneBotToolExecutionContext>();
+
+function getCurrentToolExecutionContext(): OneBotToolExecutionContext | undefined {
+  return oneBotToolContextStorage.getStore();
+}
+
+function resolveEffectiveToolTarget(
+  rawTarget: string,
+  runtimeOptions: OneBotRuntimeOptions,
+  logger?: { warn?: (msg: string) => void },
+): OneBotTarget | null {
+  const requested = parseOneBotTarget(rawTarget);
+  const contextTarget = getCurrentToolExecutionContext()?.target ?? null;
+  const effective = resolveToolTargetByPolicy(
+    requested,
+    contextTarget,
+    runtimeOptions.groupToolTargetPolicy,
+  );
+  if (
+    runtimeOptions.groupToolTargetPolicy === "force-current-group" &&
+    contextTarget?.type === "group" &&
+    requested &&
+    (requested.type !== contextTarget.type || requested.id !== contextTarget.id)
+  ) {
+    logger?.warn?.(
+      `[onebot] force current group target: requested=${requested.type}:${requested.id}, effective=group:${contextTarget.id}`,
+    );
+  }
+  return effective;
 }
 
 async function deliverTextWithQqimg(
@@ -304,23 +339,94 @@ async function sendGroupMsg(groupId: number, text: string): Promise<void> {
   await sendOneBotAction(w, "send_group_msg", { group_id: groupId, message: text });
 }
 
-/** 发送图片：message 可为 file 路径（file://、http://、base64://）或消息段数组 */
-async function sendGroupImage(groupId: number, image: string, imageCacheDir?: string): Promise<void> {
+function getRuntimeOptions(): OneBotRuntimeOptions {
+  return resolveOneBotRuntimeOptions((globalThis as any).__onebotApi?.config);
+}
+
+function extractFirstImageFileRef(segments: any[]): string | null {
+  for (const segment of segments) {
+    if (segment?.type !== "image") continue;
+    const data = segment?.data ?? {};
+    if (typeof data.file === "string" && data.file.trim()) return data.file.trim();
+    if (typeof data.url === "string" && data.url.trim()) return data.url.trim();
+  }
+  return null;
+}
+
+async function sendImageWithFallback(target: OneBotTarget, image: string, imageCacheDir?: string): Promise<void> {
   const w = ws;
   if (!w || w.readyState !== WebSocket.OPEN) throw new Error("OneBot WebSocket not connected");
-  const seg = image.startsWith("[")
-    ? JSON.parse(image)
-    : [{ type: "image", data: { file: await resolveImageForNapCat(image, imageCacheDir || resolveOneBotRuntimeOptions((globalThis as any).__onebotApi?.config).imageCacheDir) } }];
-  await sendOneBotAction(w, "send_group_msg", { group_id: groupId, message: seg });
+  const runtimeOptions = getRuntimeOptions();
+  const cacheDir = imageCacheDir || runtimeOptions.imageCacheDir;
+
+  let seg: any[];
+  let primaryFileRef: string | null = null;
+  if (image.startsWith("[")) {
+    const parsed = JSON.parse(image);
+    if (!Array.isArray(parsed)) throw new Error("图片消息段格式错误");
+    seg = parsed;
+    primaryFileRef = extractFirstImageFileRef(parsed);
+  } else {
+    primaryFileRef = await resolveImageForNapCat(image, cacheDir);
+    seg = [{ type: "image", data: { file: primaryFileRef } }];
+  }
+
+  const action = target.type === "group" ? "send_group_msg" : "send_private_msg";
+  const params =
+    target.type === "group"
+      ? { group_id: target.id, message: seg }
+      : { user_id: target.id, message: seg };
+
+  try {
+    await sendOneBotAction(w, action, params);
+    return;
+  } catch (err: any) {
+    if (!shouldFallbackToFileUpload(err, runtimeOptions.imageFailureFallback)) {
+      throw err;
+    }
+
+    const fallbackSource = primaryFileRef || image;
+    let localPath = toExistingLocalPath(fallbackSource);
+    if (!localPath) {
+      try {
+        const resolved = await resolveImageForNapCat(fallbackSource, cacheDir);
+        localPath = toExistingLocalPath(resolved);
+      } catch {
+        localPath = null;
+      }
+    }
+    if (!localPath) throw err;
+
+    const name = resolveUploadFileName(localPath);
+    if (target.type === "group") {
+      await uploadGroupFileAction(target.id, localPath, name);
+      if (runtimeOptions.imageFailureFallbackNotice) {
+        try {
+          await sendGroupMsg(target.id, `图片发送失败，已转为群文件：${name}`);
+        } catch {
+          // ignore notice failure
+        }
+      }
+    } else {
+      await uploadPrivateFileAction(target.id, localPath, name);
+      if (runtimeOptions.imageFailureFallbackNotice) {
+        try {
+          await sendPrivateMsg(target.id, `图片发送失败，已转为文件：${name}`);
+        } catch {
+          // ignore notice failure
+        }
+      }
+    }
+  }
+}
+
+/** 发送图片：message 可为 file 路径（file://、http://、base64://）或消息段数组 */
+async function sendGroupImage(groupId: number, image: string, imageCacheDir?: string): Promise<void> {
+  await sendImageWithFallback({ type: "group", id: groupId }, image, imageCacheDir);
 }
 
 async function sendPrivateImage(userId: number, image: string, imageCacheDir?: string): Promise<void> {
-  const w = ws;
-  if (!w || w.readyState !== WebSocket.OPEN) throw new Error("OneBot WebSocket not connected");
-  const seg = image.startsWith("[")
-    ? JSON.parse(image)
-    : [{ type: "image", data: { file: await resolveImageForNapCat(image, imageCacheDir || resolveOneBotRuntimeOptions((globalThis as any).__onebotApi?.config).imageCacheDir) } }];
-  await sendOneBotAction(w, "send_private_msg", { user_id: userId, message: seg });
+  await sendImageWithFallback({ type: "user", id: userId }, image, imageCacheDir);
 }
 
 async function setMsgEmojiLike(messageId: number, emojiId: number, set: boolean): Promise<void> {
@@ -474,6 +580,11 @@ async function processInboundMessage(api: any, msg: OneBotMessage): Promise<void
   const envelopeOptions = runtime.channel.reply?.resolveEnvelopeFormatOptions?.(cfg) ?? {};
   const chatType = isGroup ? "group" : "direct";
   const fromLabel = String(userId);
+  const currentTarget: OneBotTarget =
+    isGroup && groupId ? { type: "group", id: groupId } : { type: "user", id: userId };
+  const conversationLabel =
+    currentTarget.type === "group" ? `group:${currentTarget.id}` : `user:${currentTarget.id}`;
+  const routeTo = `${currentTarget.type}:${currentTarget.id}`;
 
   const formattedBody =
     runtime.channel.reply?.formatInboundEnvelope?.({
@@ -523,11 +634,14 @@ async function processInboundMessage(api: any, msg: OneBotMessage): Promise<void
     Body: body,
     RawBody: messageText,
     From: isGroup ? `onebot:group:${groupId}` : `onebot:${userId}`,
-    To: `onebot:${userId}`,
+    To:
+      currentTarget.type === "group"
+        ? `onebot:group:${currentTarget.id}`
+        : `onebot:${currentTarget.id}`,
     SessionKey: sessionId,
     AccountId: config.accountId ?? "default",
     ChatType: chatType,
-    ConversationLabel: fromLabel,
+    ConversationLabel: conversationLabel,
     SenderName: fromLabel,
     SenderId: String(userId),
     Provider: "onebot",
@@ -535,7 +649,10 @@ async function processInboundMessage(api: any, msg: OneBotMessage): Promise<void
     MessageSid: `onebot-${Date.now()}`,
     Timestamp: Date.now(),
     OriginatingChannel: "onebot",
-    OriginatingTo: `onebot:${userId}`,
+    OriginatingTo:
+      currentTarget.type === "group"
+        ? `onebot:group:${currentTarget.id}`
+        : `onebot:${currentTarget.id}`,
     CommandAuthorized: true,
     _onebot: { userId, groupId, isGroup },
   };
@@ -545,7 +662,12 @@ async function processInboundMessage(api: any, msg: OneBotMessage): Promise<void
       storePath,
       sessionKey: sessionId,
       ctx: ctxPayload,
-      updateLastRoute: !isGroup ? { sessionKey: sessionId, channel: "onebot", to: String(userId), accountId: config.accountId ?? "default" } : undefined,
+      updateLastRoute: {
+        sessionKey: sessionId,
+        channel: "onebot",
+        to: routeTo,
+        accountId: config.accountId ?? "default",
+      },
       onRecordError: (err: any) => api.logger?.warn?.(`[onebot] recordInboundSession: ${err}`),
     });
   }
@@ -581,56 +703,68 @@ async function processInboundMessage(api: any, msg: OneBotMessage): Promise<void
   api.logger?.info?.(`[onebot] dispatching message for session ${sessionId}`);
 
   try {
-    await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
-      ctx: ctxPayload,
-      cfg,
-      dispatcherOptions: {
-        deliver: async (
-          payload: { text?: string; body?: string; mediaUrl?: string; mediaUrls?: string[] },
-          info: { kind: string },
-        ) => {
-          const replyText = stripNoReplyMarker(
-            typeof payload.text === "string" ? payload.text : typeof payload.body === "string" ? payload.body : "",
-          );
-          const mediaCandidates = [
-            ...(Array.isArray(payload.mediaUrls) ? payload.mediaUrls.filter((v) => typeof v === "string" && v.trim()) : []),
-            ...(typeof payload.mediaUrl === "string" && payload.mediaUrl.trim() ? [payload.mediaUrl] : []),
-          ];
-          if (!replyText && mediaCandidates.length === 0) return;
-
-          await clearEmojiReaction();
-          const { userId: uid, groupId: gid, isGroup: ig } = (ctxPayload as any)._onebot || {};
-          const target = ig && gid ? ({ type: "group", id: gid } as const) : uid ? ({ type: "user", id: uid } as const) : null;
-          if (!target) return;
-          try {
-            if (replyText) {
-              await deliverTextWithQqimg(replyText, target, runtimeOptions, api.logger);
-            }
-            for (const mediaUrl of mediaCandidates) {
-              if (target.type === "group") {
-                await sendGroupImage(target.id, mediaUrl, runtimeOptions.imageCacheDir);
-              } else {
-                await sendPrivateImage(target.id, mediaUrl, runtimeOptions.imageCacheDir);
-              }
-            }
-            if (info.kind === "final" && clearHistoryEntriesIfEnabled) {
-              clearHistoryEntriesIfEnabled({
-                historyMap: sessionHistories,
-                historyKey: sessionId,
-                limit: DEFAULT_HISTORY_LIMIT,
-              });
-            }
-          } catch (e: any) {
-            api.logger?.error?.(`[onebot] deliver failed: ${e?.message}`);
-          }
-        },
-        onError: async (err: any, info: any) => {
-          await clearEmojiReaction();
-          api.logger?.error?.(`[onebot] ${info?.kind} reply failed: ${err}`);
-        },
+    await oneBotToolContextStorage.run(
+      {
+        target: currentTarget,
+        sessionKey: sessionId,
+        chatType,
       },
-      replyOptions: { disableBlockStreaming: true },
-    });
+      async () => {
+        await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+          ctx: ctxPayload,
+          cfg,
+          dispatcherOptions: {
+            deliver: async (
+              payload: { text?: string; body?: string; mediaUrl?: string; mediaUrls?: string[] },
+              info: { kind: string },
+            ) => {
+              const replyText = stripNoReplyMarker(
+                typeof payload.text === "string" ? payload.text : typeof payload.body === "string" ? payload.body : "",
+              );
+              const mediaCandidates = [
+                ...(Array.isArray(payload.mediaUrls)
+                  ? payload.mediaUrls.filter((v) => typeof v === "string" && v.trim())
+                  : []),
+                ...(typeof payload.mediaUrl === "string" && payload.mediaUrl.trim() ? [payload.mediaUrl] : []),
+              ];
+              if (!replyText && mediaCandidates.length === 0) return;
+
+              await clearEmojiReaction();
+              const { userId: uid, groupId: gid, isGroup: ig } = (ctxPayload as any)._onebot || {};
+              const target =
+                ig && gid ? ({ type: "group", id: gid } as const) : uid ? ({ type: "user", id: uid } as const) : null;
+              if (!target) return;
+              try {
+                if (replyText) {
+                  await deliverTextWithQqimg(replyText, target, runtimeOptions, api.logger);
+                }
+                for (const mediaUrl of mediaCandidates) {
+                  if (target.type === "group") {
+                    await sendGroupImage(target.id, mediaUrl, runtimeOptions.imageCacheDir);
+                  } else {
+                    await sendPrivateImage(target.id, mediaUrl, runtimeOptions.imageCacheDir);
+                  }
+                }
+                if (info.kind === "final" && clearHistoryEntriesIfEnabled) {
+                  clearHistoryEntriesIfEnabled({
+                    historyMap: sessionHistories,
+                    historyKey: sessionId,
+                    limit: DEFAULT_HISTORY_LIMIT,
+                  });
+                }
+              } catch (e: any) {
+                api.logger?.error?.(`[onebot] deliver failed: ${e?.message}`);
+              }
+            },
+            onError: async (err: any, info: any) => {
+              await clearEmojiReaction();
+              api.logger?.error?.(`[onebot] ${info?.kind} reply failed: ${err}`);
+            },
+          },
+          replyOptions: { disableBlockStreaming: true },
+        });
+      },
+    );
   } catch (err: any) {
     await clearEmojiReaction();
     api.logger?.error?.(`[onebot] dispatch failed: ${err?.message}`);
@@ -748,12 +882,12 @@ export default function register(api: any): void {
         if (!w || w.readyState !== WebSocket.OPEN) {
           return { content: [{ type: "text", text: "OneBot 未连接" }] };
         }
-        const target = parseOneBotTarget(params.target);
+        const runtimeOptions = getRuntimeOptions();
+        const target = resolveEffectiveToolTarget(params.target, runtimeOptions, (globalThis as any).__onebotApi?.logger);
         if (!target) {
           return { content: [{ type: "text", text: `目标格式错误: ${params.target}` }] };
         }
         try {
-          const runtimeOptions = resolveOneBotRuntimeOptions((globalThis as any).__onebotApi?.config);
           await deliverTextWithQqimg(params.text, target, runtimeOptions, (globalThis as any).__onebotApi?.logger);
           return { content: [{ type: "text", text: "发送成功" }] };
         } catch (e: any) {
@@ -778,12 +912,12 @@ export default function register(api: any): void {
         if (!w || w.readyState !== WebSocket.OPEN) {
           return { content: [{ type: "text", text: "OneBot 未连接" }] };
         }
-        const target = parseOneBotTarget(params.target);
+        const runtimeOptions = getRuntimeOptions();
+        const target = resolveEffectiveToolTarget(params.target, runtimeOptions, (globalThis as any).__onebotApi?.logger);
         if (!target) {
           return { content: [{ type: "text", text: `目标格式错误: ${params.target}` }] };
         }
         try {
-          const runtimeOptions = resolveOneBotRuntimeOptions((globalThis as any).__onebotApi?.config);
           if (target.type === "group") {
             await sendGroupImage(target.id, params.image, runtimeOptions.imageCacheDir);
           } else {
@@ -813,7 +947,8 @@ export default function register(api: any): void {
         if (!w || w.readyState !== WebSocket.OPEN) {
           return { content: [{ type: "text", text: "OneBot 未连接" }] };
         }
-        const target = parseOneBotTarget(params.target);
+        const runtimeOptions = getRuntimeOptions();
+        const target = resolveEffectiveToolTarget(params.target, runtimeOptions, (globalThis as any).__onebotApi?.logger);
         if (!target) {
           return { content: [{ type: "text", text: `目标格式错误: ${params.target}` }] };
         }
