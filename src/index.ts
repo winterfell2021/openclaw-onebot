@@ -9,12 +9,15 @@ import WebSocket from "ws";
 import { createServer } from "http";
 import { AsyncLocalStorage } from "async_hooks";
 import { readFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { basename, dirname, extname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { cleanupImageCache, resolveImageForNapCat } from "./image";
+import { cleanupVideoCache, resolveVideoForNapCat } from "./video";
+import { convertVideoToGif } from "./video-gif";
 import { resolveOneBotRuntimeOptions, type OneBotRuntimeOptions } from "./options";
-import { resolveUploadFileName, shouldFallbackToFileUpload, toExistingLocalPath } from "./image-fallback";
-import { parseQqimgSegments } from "./qqimg";
+import { normalizeFileUriToPath, resolveUploadFileName, shouldFallbackToFileUpload, toExistingLocalPath } from "./image-fallback";
+import { parseQqMediaSegments } from "./qqmedia";
+import { appendGroupChatLog } from "./group-chat-log";
 import { resolveToolTargetByPolicy, type OneBotTarget } from "./target-policy";
 import { parseOneBotInboundMessage, resolveInboundMediaForPrompt } from "./inbound-media";
 import { GroupMentionMediaCache } from "./group-media-cache";
@@ -181,22 +184,135 @@ function stripNoReplyMarker(text: string): string {
   return trimmed.replace(/\s*NO_REPLY\s*$/g, "").trim();
 }
 
-let imageCacheCleanupTimer: ReturnType<typeof setInterval> | null = null;
+const VIDEO_EXTENSIONS = new Set([
+  ".mp4",
+  ".mov",
+  ".webm",
+  ".mkv",
+  ".avi",
+  ".m4v",
+  ".flv",
+]);
 
-function startImageCacheCleanupLoop(cacheDir: string): void {
-  stopImageCacheCleanupLoop();
-  const runtimeOptions = getRuntimeOptions();
-  cleanupImageCache(cacheDir, runtimeOptions.imageCacheMaxAgeMs);
-  imageCacheCleanupTimer = setInterval(() => {
-    const latestOptions = getRuntimeOptions();
-    cleanupImageCache(cacheDir, latestOptions.imageCacheMaxAgeMs);
+type OutboundMediaKind = "image" | "video";
+type OutboundReplyId = string | number;
+
+interface OneBotSendOptions {
+  replyToId?: OutboundReplyId | null;
+  caption?: string;
+}
+
+function normalizeReplyToId(value: unknown): OutboundReplyId | undefined {
+  if (value === null || value === undefined) return undefined;
+  const text = String(value).trim();
+  if (!text) return undefined;
+  if (/^\d+$/.test(text)) {
+    const num = Number(text);
+    if (Number.isSafeInteger(num)) return num;
+  }
+  return text;
+}
+
+function normalizeCaptionText(value: unknown): string {
+  return String(value ?? "").trim();
+}
+
+function buildGroupReplySegment(replyToId?: OutboundReplyId | null): any[] {
+  const normalized = normalizeReplyToId(replyToId);
+  if (normalized === undefined) return [];
+  return [{ type: "reply", data: { id: normalized } }];
+}
+
+function buildMessageWithOptionalPrefix(
+  target: OneBotTarget,
+  baseSegments: any[],
+  options: OneBotSendOptions = {},
+): any[] {
+  const segments: any[] = [];
+  if (target.type === "group") {
+    segments.push(...buildGroupReplySegment(options.replyToId));
+  }
+  const caption = normalizeCaptionText(options.caption);
+  if (caption) {
+    segments.push({ type: "text", data: { text: caption } });
+  }
+  segments.push(...baseSegments);
+  return segments;
+}
+
+function buildTextPayload(target: OneBotTarget, text: string, replyToId?: OutboundReplyId | null): string | any[] | null {
+  const cleaned = normalizeCaptionText(text);
+  if (!cleaned) return null;
+  if (target.type !== "group") return cleaned;
+  const replySegments = buildGroupReplySegment(replyToId);
+  if (replySegments.length === 0) return cleaned;
+  return [
+    ...replySegments,
+    { type: "text", data: { text: cleaned } },
+  ];
+}
+
+async function sendUploadFallbackCaption(target: OneBotTarget, options: OneBotSendOptions = {}): Promise<void> {
+  const caption = normalizeCaptionText(options.caption);
+  if (!caption) return;
+  if (target.type === "group") {
+    await sendGroupMsg(target.id, caption, { replyToId: options.replyToId });
+    return;
+  }
+  await sendPrivateMsg(target.id, caption);
+}
+
+function resolveMessageTimestampMs(msg: OneBotMessage): number {
+  const raw = Number(msg.time);
+  if (Number.isFinite(raw) && raw > 0) {
+    if (raw > 1_000_000_000_000) return Math.floor(raw);
+    return Math.floor(raw * 1000);
+  }
+  return Date.now();
+}
+
+function resolveOutboundMediaKind(value: string, autoDetectVideo: boolean): OutboundMediaKind {
+  const source = String(value || "").trim();
+  if (!autoDetectVideo || !source) return "image";
+  if (/^data:video\//i.test(source)) return "video";
+
+  if (source.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(source);
+      if (Array.isArray(parsed)) {
+        const hasVideoSegment = parsed.some((item) => item?.type === "video");
+        if (hasVideoSegment) return "video";
+      }
+    } catch {
+      // ignore malformed segment json
+    }
+  }
+
+  const normalized = normalizeFileUriToPath(source);
+  const ext = extname(normalized.split("?")[0] || "").toLowerCase();
+  if (VIDEO_EXTENSIONS.has(ext)) return "video";
+  return "image";
+}
+
+let mediaCacheCleanupTimer: ReturnType<typeof setInterval> | null = null;
+
+function cleanupMediaCacheByOptions(options: OneBotRuntimeOptions): void {
+  cleanupImageCache(options.imageCacheDir, options.imageCacheMaxAgeMs);
+  cleanupVideoCache(options.videoCacheDir, options.videoCacheMaxAgeMs);
+}
+
+function startMediaCacheCleanupLoop(): void {
+  stopMediaCacheCleanupLoop();
+  cleanupMediaCacheByOptions(getRuntimeOptions());
+  mediaCacheCleanupTimer = setInterval(() => {
+    cleanupMediaCacheByOptions(getRuntimeOptions());
   }, 60 * 60 * 1000);
 }
 
-function stopImageCacheCleanupLoop(): void {
-  if (!imageCacheCleanupTimer) return;
-  clearInterval(imageCacheCleanupTimer);
-  imageCacheCleanupTimer = null;
+function stopMediaCacheCleanupLoop(): void {
+  if (!mediaCacheCleanupTimer) return;
+  clearInterval(mediaCacheCleanupTimer);
+  mediaCacheCleanupTimer = null;
 }
 
 interface OneBotToolExecutionContext {
@@ -236,30 +352,50 @@ function resolveEffectiveToolTarget(
   return effective;
 }
 
-async function deliverTextWithQqimg(
+async function deliverTextWithQqMedia(
   text: string,
   target: OneBotTarget,
   options: OneBotRuntimeOptions,
   logger?: { error?: (msg: string) => void },
+  replyToId?: OutboundReplyId | null,
 ): Promise<void> {
   const cleaned = stripNoReplyMarker(text);
   if (!cleaned) return;
 
-  if (!options.qqimgTagEnabled) {
-    if (target.type === "group") await sendGroupMsg(target.id, cleaned);
+  let pendingReplyToId: OutboundReplyId | null = normalizeReplyToId(replyToId) ?? null;
+  const consumeReplyToId = (): OutboundReplyId | undefined => {
+    if (pendingReplyToId === null) return undefined;
+    const value = pendingReplyToId;
+    pendingReplyToId = null;
+    return value;
+  };
+
+  if (!options.qqimgTagEnabled && !options.qqvideoTagEnabled) {
+    if (target.type === "group") await sendGroupMsg(target.id, cleaned, { replyToId: consumeReplyToId() });
     else await sendPrivateMsg(target.id, cleaned);
     return;
   }
 
-  const queue = parseQqimgSegments(cleaned, options.qqimgTagCloseVariants);
+  const queue = parseQqMediaSegments(cleaned, {
+    imageCloseVariants: options.qqimgTagEnabled ? options.qqimgTagCloseVariants : [],
+    videoCloseVariants: options.qqvideoTagEnabled ? options.qqvideoTagCloseVariants : [],
+  });
   for (const item of queue) {
     try {
+      const currentReplyToId = consumeReplyToId();
       if (item.type === "text") {
-        if (target.type === "group") await sendGroupMsg(target.id, item.content);
+        if (target.type === "group") await sendGroupMsg(target.id, item.content, { replyToId: currentReplyToId });
         else await sendPrivateMsg(target.id, item.content);
-      } else {
-        if (target.type === "group") await sendGroupImage(target.id, item.content, options.imageCacheDir);
+      } else if (item.type === "image") {
+        if (target.type === "group") {
+          await sendGroupImage(target.id, item.content, options.imageCacheDir, { replyToId: currentReplyToId });
+        }
         else await sendPrivateImage(target.id, item.content, options.imageCacheDir);
+      } else {
+        if (target.type === "group") {
+          await sendGroupVideo(target.id, item.content, options.videoCacheDir, { replyToId: currentReplyToId });
+        }
+        else await sendPrivateVideo(target.id, item.content, options.videoCacheDir);
       }
     } catch (err: any) {
       logger?.error?.(`[onebot] send ${item.type} failed: ${err?.message || err}`);
@@ -332,20 +468,24 @@ function sendOneBotAction(wsocket: WebSocket, action: string, params: Record<str
   });
 }
 
-async function sendPrivateMsg(userId: number, text: string): Promise<void> {
+async function sendPrivateMsg(userId: number, text: string, _options: OneBotSendOptions = {}): Promise<void> {
   const w = ws;
   if (!w || w.readyState !== WebSocket.OPEN) {
     throw new Error("OneBot WebSocket not connected");
   }
-  await sendOneBotAction(w, "send_private_msg", { user_id: userId, message: text });
+  const payload = buildTextPayload({ type: "user", id: userId }, text);
+  if (!payload) return;
+  await sendOneBotAction(w, "send_private_msg", { user_id: userId, message: payload });
 }
 
-async function sendGroupMsg(groupId: number, text: string): Promise<void> {
+async function sendGroupMsg(groupId: number, text: string, options: OneBotSendOptions = {}): Promise<void> {
   const w = ws;
   if (!w || w.readyState !== WebSocket.OPEN) {
     throw new Error("OneBot WebSocket not connected");
   }
-  await sendOneBotAction(w, "send_group_msg", { group_id: groupId, message: text });
+  const payload = buildTextPayload({ type: "group", id: groupId }, text, options.replyToId);
+  if (!payload) return;
+  await sendOneBotAction(w, "send_group_msg", { group_id: groupId, message: payload });
 }
 
 function getRuntimeOptions(): OneBotRuntimeOptions {
@@ -362,7 +502,22 @@ function extractFirstImageFileRef(segments: any[]): string | null {
   return null;
 }
 
-async function sendImageWithFallback(target: OneBotTarget, image: string, imageCacheDir?: string): Promise<void> {
+function extractFirstVideoFileRef(segments: any[]): string | null {
+  for (const segment of segments) {
+    if (segment?.type !== "video") continue;
+    const data = segment?.data ?? {};
+    if (typeof data.file === "string" && data.file.trim()) return data.file.trim();
+    if (typeof data.url === "string" && data.url.trim()) return data.url.trim();
+  }
+  return null;
+}
+
+async function sendImageWithFallback(
+  target: OneBotTarget,
+  image: string,
+  imageCacheDir?: string,
+  options: OneBotSendOptions = {},
+): Promise<void> {
   const w = ws;
   if (!w || w.readyState !== WebSocket.OPEN) throw new Error("OneBot WebSocket not connected");
   const runtimeOptions = getRuntimeOptions();
@@ -380,11 +535,12 @@ async function sendImageWithFallback(target: OneBotTarget, image: string, imageC
     seg = [{ type: "image", data: { file: primaryFileRef } }];
   }
 
+  const composedMessage = buildMessageWithOptionalPrefix(target, seg, options);
   const action = target.type === "group" ? "send_group_msg" : "send_private_msg";
   const params =
     target.type === "group"
-      ? { group_id: target.id, message: seg }
-      : { user_id: target.id, message: seg };
+      ? { group_id: target.id, message: composedMessage }
+      : { user_id: target.id, message: composedMessage };
 
   try {
     await sendOneBotAction(w, action, params);
@@ -410,6 +566,12 @@ async function sendImageWithFallback(target: OneBotTarget, image: string, imageC
     }
     if (!localPath) throw err;
 
+    try {
+      await sendUploadFallbackCaption(target, options);
+    } catch {
+      // ignore caption fallback failure
+    }
+
     const name = resolveUploadFileName(localPath);
     if (target.type === "group") {
       await uploadGroupFileAction(target.id, localPath, name);
@@ -433,13 +595,192 @@ async function sendImageWithFallback(target: OneBotTarget, image: string, imageC
   }
 }
 
-/** 发送图片：message 可为 file 路径（file://、http://、base64://）或消息段数组 */
-async function sendGroupImage(groupId: number, image: string, imageCacheDir?: string): Promise<void> {
-  await sendImageWithFallback({ type: "group", id: groupId }, image, imageCacheDir);
+function resolveVideoUploadFileName(localPath: string): string {
+  const name = basename(localPath);
+  if (name) return name;
+  return "onebot-video.mp4";
 }
 
-async function sendPrivateImage(userId: number, image: string, imageCacheDir?: string): Promise<void> {
-  await sendImageWithFallback({ type: "user", id: userId }, image, imageCacheDir);
+async function resolveExistingVideoLocalPath(videoRef: string, runtimeOptions: OneBotRuntimeOptions): Promise<string | null> {
+  let localPath = toExistingLocalPath(videoRef);
+  if (localPath) return localPath;
+  try {
+    const resolved = await resolveVideoForNapCat(videoRef, runtimeOptions.videoCacheDir, {
+      cacheMaxAgeMs: runtimeOptions.videoCacheMaxAgeMs,
+      maxBytes: runtimeOptions.videoMaxBytes,
+    });
+    localPath = toExistingLocalPath(resolved);
+    return localPath;
+  } catch {
+    return null;
+  }
+}
+
+async function sendVideoWithFallback(
+  target: OneBotTarget,
+  video: string,
+  videoCacheDir?: string,
+  options: OneBotSendOptions = {},
+): Promise<void> {
+  const w = ws;
+  if (!w || w.readyState !== WebSocket.OPEN) throw new Error("OneBot WebSocket not connected");
+
+  const runtimeOptions = getRuntimeOptions();
+  const cacheDir = videoCacheDir || runtimeOptions.videoCacheDir;
+
+  let seg: any[];
+  let primaryFileRef: string | null = null;
+  if (video.startsWith("[")) {
+    const parsed = JSON.parse(video);
+    if (!Array.isArray(parsed)) throw new Error("视频消息段格式错误");
+    seg = parsed;
+    primaryFileRef = extractFirstVideoFileRef(parsed);
+  } else {
+    primaryFileRef = await resolveVideoForNapCat(video, cacheDir, {
+      cacheMaxAgeMs: runtimeOptions.videoCacheMaxAgeMs,
+      maxBytes: runtimeOptions.videoMaxBytes,
+    });
+    seg = [{ type: "video", data: { file: primaryFileRef } }];
+  }
+
+  const composedMessage = buildMessageWithOptionalPrefix(target, seg, options);
+  const action = target.type === "group" ? "send_group_msg" : "send_private_msg";
+  const params =
+    target.type === "group"
+      ? { group_id: target.id, message: composedMessage }
+      : { user_id: target.id, message: composedMessage };
+
+  try {
+    await sendOneBotAction(w, action, params);
+    return;
+  } catch (err: any) {
+    if (runtimeOptions.videoFailureFallback === "none") {
+      throw err;
+    }
+
+    const fallbackSource = primaryFileRef || video;
+    const localPath = await resolveExistingVideoLocalPath(fallbackSource, runtimeOptions);
+    if (!localPath) throw err;
+
+    if (runtimeOptions.videoFailureFallback === "gif") {
+      try {
+        const gifPath = await convertVideoToGif(localPath, runtimeOptions.videoCacheDir, {
+          timeoutMs: runtimeOptions.videoGifTimeoutMs,
+          fps: runtimeOptions.videoGifFps,
+          width: runtimeOptions.videoGifWidth,
+        });
+        if (target.type === "group") {
+          await sendGroupImage(target.id, gifPath, runtimeOptions.imageCacheDir, options);
+        } else {
+          await sendPrivateImage(target.id, gifPath, runtimeOptions.imageCacheDir, options);
+        }
+        if (runtimeOptions.videoFailureFallbackNotice) {
+          try {
+            if (target.type === "group") {
+              await sendGroupMsg(target.id, "视频发送失败，已转 GIF 发送");
+            } else {
+              await sendPrivateMsg(target.id, "视频发送失败，已转 GIF 发送");
+            }
+          } catch {
+            // ignore notice failure
+          }
+        }
+        return;
+      } catch {
+        // gif fallback failed, continue with file upload fallback
+      }
+    }
+
+    try {
+      await sendUploadFallbackCaption(target, options);
+    } catch {
+      // ignore caption fallback failure
+    }
+
+    const name = resolveVideoUploadFileName(localPath);
+    if (target.type === "group") {
+      await uploadGroupFileAction(target.id, localPath, name);
+      if (runtimeOptions.videoFailureFallbackNotice) {
+        try {
+          await sendGroupMsg(target.id, `视频发送失败，已转为群文件：${name}`);
+        } catch {
+          // ignore notice failure
+        }
+      }
+    } else {
+      await uploadPrivateFileAction(target.id, localPath, name);
+      if (runtimeOptions.videoFailureFallbackNotice) {
+        try {
+          await sendPrivateMsg(target.id, `视频发送失败，已转为文件：${name}`);
+        } catch {
+          // ignore notice failure
+        }
+      }
+    }
+  }
+}
+
+/** 发送图片：message 可为 file 路径（file://、http://、base64://）或消息段数组 */
+async function sendGroupImage(
+  groupId: number,
+  image: string,
+  imageCacheDir?: string,
+  options: OneBotSendOptions = {},
+): Promise<void> {
+  await sendImageWithFallback({ type: "group", id: groupId }, image, imageCacheDir, options);
+}
+
+async function sendPrivateImage(
+  userId: number,
+  image: string,
+  imageCacheDir?: string,
+  options: OneBotSendOptions = {},
+): Promise<void> {
+  await sendImageWithFallback({ type: "user", id: userId }, image, imageCacheDir, options);
+}
+
+/** 发送视频：message 可为 file 路径（file://、http://、base64://）或消息段数组 */
+async function sendGroupVideo(
+  groupId: number,
+  video: string,
+  videoCacheDir?: string,
+  options: OneBotSendOptions = {},
+): Promise<void> {
+  await sendVideoWithFallback({ type: "group", id: groupId }, video, videoCacheDir, options);
+}
+
+async function sendPrivateVideo(
+  userId: number,
+  video: string,
+  videoCacheDir?: string,
+  options: OneBotSendOptions = {},
+): Promise<void> {
+  await sendVideoWithFallback({ type: "user", id: userId }, video, videoCacheDir, options);
+}
+
+async function sendMediaByKind(
+  target: OneBotTarget,
+  mediaUrl: string,
+  runtimeOptions: OneBotRuntimeOptions,
+  options: OneBotSendOptions = {},
+): Promise<void> {
+  const mediaKind = resolveOutboundMediaKind(
+    mediaUrl,
+    runtimeOptions.autoDetectVideoFromMediaUrls,
+  );
+  if (mediaKind === "video") {
+    if (target.type === "group") {
+      await sendGroupVideo(target.id, mediaUrl, runtimeOptions.videoCacheDir, options);
+    } else {
+      await sendPrivateVideo(target.id, mediaUrl, runtimeOptions.videoCacheDir, options);
+    }
+    return;
+  }
+  if (target.type === "group") {
+    await sendGroupImage(target.id, mediaUrl, runtimeOptions.imageCacheDir, options);
+  } else {
+    await sendPrivateImage(target.id, mediaUrl, runtimeOptions.imageCacheDir, options);
+  }
 }
 
 async function setMsgEmojiLike(messageId: number, emojiId: number, set: boolean): Promise<void> {
@@ -520,7 +861,15 @@ const OneBotChannelPlugin = {
       if (!t) return { ok: false, error: new Error("OneBot requires --to <user_id|group_id>") };
       return { ok: true, to: t };
     },
-    sendText: async ({ to, text }: { to: string; text: string }) => {
+    sendText: async ({
+      to,
+      text,
+      replyToId,
+    }: {
+      to: string;
+      text: string;
+      replyToId?: string | null;
+    }) => {
       const config = getOneBotConfig((globalThis as any).__onebotApi);
       if (!config) {
         return { ok: false, error: new Error("OneBot not configured") };
@@ -534,7 +883,47 @@ const OneBotChannelPlugin = {
         return { ok: false, error: new Error(`invalid target: ${to}`) };
       }
       const runtimeOptions = resolveOneBotRuntimeOptions((globalThis as any).__onebotApi?.config);
-      await deliverTextWithQqimg(text, target, runtimeOptions, (globalThis as any).__onebotApi?.logger);
+      await deliverTextWithQqMedia(
+        text,
+        target,
+        runtimeOptions,
+        (globalThis as any).__onebotApi?.logger,
+        replyToId,
+      );
+      return { ok: true, provider: "onebot" };
+    },
+    sendMedia: async ({
+      to,
+      text,
+      mediaUrl,
+      replyToId,
+    }: {
+      to: string;
+      text?: string;
+      mediaUrl?: string;
+      replyToId?: string | null;
+    }) => {
+      const config = getOneBotConfig((globalThis as any).__onebotApi);
+      if (!config) {
+        return { ok: false, error: new Error("OneBot not configured") };
+      }
+      const w = ws;
+      if (!w || w.readyState !== WebSocket.OPEN) {
+        return { ok: false, error: new Error("OneBot WebSocket not connected") };
+      }
+      const target = parseOneBotTarget(to);
+      if (!target) {
+        return { ok: false, error: new Error(`invalid target: ${to}`) };
+      }
+      const resolvedMediaUrl = String(mediaUrl ?? "").trim();
+      if (!resolvedMediaUrl) {
+        return { ok: false, error: new Error("mediaUrl is required") };
+      }
+      const runtimeOptions = resolveOneBotRuntimeOptions((globalThis as any).__onebotApi?.config);
+      await sendMediaByKind(target, resolvedMediaUrl, runtimeOptions, {
+        caption: text,
+        replyToId,
+      });
       return { ok: true, provider: "onebot" };
     },
   },
@@ -581,8 +970,41 @@ async function processInboundMessage(api: any, msg: OneBotMessage): Promise<void
   const mentioned = isMentioned(msg, selfId);
   const userId = msg.user_id!;
   const groupId = msg.group_id;
+  const ignoredByMention = isGroup && requireMention && !mentioned;
+  const messageTimestampMs = resolveMessageTimestampMs(msg);
 
-  if (isGroup && requireMention && !mentioned) {
+  if (isGroup && typeof groupId === "number" && typeof userId === "number" && runtimeOptions.groupChatLogEnabled) {
+    const shouldLog = Boolean(messageText?.trim()) || parsedInbound.imageSources.length > 0 || Boolean(msg.raw_message?.trim());
+    if (shouldLog) {
+      appendGroupChatLog(
+        {
+          groupId,
+          userId,
+          selfId,
+          messageId: typeof msg.message_id === "number" ? msg.message_id : undefined,
+          mentioned,
+          ignoredByMention,
+          messageTimestampMs,
+          receivedTimestampMs: Date.now(),
+          text: messageText || "",
+          rawMessage: typeof msg.raw_message === "string" ? msg.raw_message : undefined,
+          imageSources: parsedInbound.imageSources,
+          resolvedMediaCount: inboundMedia.paths.length,
+        },
+        {
+          enabled: runtimeOptions.groupChatLogEnabled,
+          logDir: runtimeOptions.groupChatLogDir,
+          timeZone: runtimeOptions.groupChatLogTimeZone,
+          maxTextLength: runtimeOptions.groupChatLogMaxTextLength,
+          includeRawMessage: runtimeOptions.groupChatLogIncludeRawMessage,
+        },
+      ).catch((err: any) => {
+        api.logger?.warn?.(`[onebot] append group chat log failed: ${err?.message || err}`);
+      });
+    }
+  }
+
+  if (ignoredByMention) {
     if (typeof groupId === "number" && typeof userId === "number" && hasEffectiveInboundMedia) {
       const cached = groupMentionMediaCache.record(groupId, userId, effectiveInboundMedia);
       if (cached) {
@@ -737,6 +1159,7 @@ async function processInboundMessage(api: any, msg: OneBotMessage): Promise<void
   }
 
   const inboundMessageId = typeof msg.message_id === "number" ? msg.message_id : undefined;
+  const groupReplyToId = isGroup && inboundMessageId != null ? inboundMessageId : undefined;
   let emojiAdded = false;
   const clearEmojiReaction = async () => {
     if (!emojiAdded || inboundMessageId == null) return;
@@ -793,14 +1216,24 @@ async function processInboundMessage(api: any, msg: OneBotMessage): Promise<void
                 ig && gid ? ({ type: "group", id: gid } as const) : uid ? ({ type: "user", id: uid } as const) : null;
               if (!target) return;
               try {
-                if (replyText) {
-                  await deliverTextWithQqimg(replyText, target, runtimeOptions, api.logger);
-                }
-                for (const mediaUrl of mediaCandidates) {
-                  if (target.type === "group") {
-                    await sendGroupImage(target.id, mediaUrl, runtimeOptions.imageCacheDir);
-                  } else {
-                    await sendPrivateImage(target.id, mediaUrl, runtimeOptions.imageCacheDir);
+                if (mediaCandidates.length === 0) {
+                  if (replyText) {
+                    await deliverTextWithQqMedia(
+                      replyText,
+                      target,
+                      runtimeOptions,
+                      api.logger,
+                      groupReplyToId,
+                    );
+                  }
+                } else {
+                  let isFirstMedia = true;
+                  for (const mediaUrl of mediaCandidates) {
+                    await sendMediaByKind(target, mediaUrl, runtimeOptions, {
+                      caption: isFirstMedia ? replyText : "",
+                      replyToId: isFirstMedia ? groupReplyToId : undefined,
+                    });
+                    isFirstMedia = false;
                   }
                 }
                 if (info.kind === "final" && clearHistoryEntriesIfEnabled) {
@@ -819,7 +1252,7 @@ async function processInboundMessage(api: any, msg: OneBotMessage): Promise<void
               api.logger?.error?.(`[onebot] ${info?.kind} reply failed: ${err}`);
             },
           },
-          replyOptions: { disableBlockStreaming: true },
+          replyOptions: { disableBlockStreaming: !runtimeOptions.blockStreaming },
         });
       },
     );
@@ -946,7 +1379,7 @@ export default function register(api: any): void {
           return { content: [{ type: "text", text: `目标格式错误: ${params.target}` }] };
         }
         try {
-          await deliverTextWithQqimg(params.text, target, runtimeOptions, (globalThis as any).__onebotApi?.logger);
+          await deliverTextWithQqMedia(params.text, target, runtimeOptions, (globalThis as any).__onebotApi?.logger);
           return { content: [{ type: "text", text: "发送成功" }] };
         } catch (e: any) {
           return { content: [{ type: "text", text: `发送失败: ${e?.message}` }] };
@@ -982,6 +1415,41 @@ export default function register(api: any): void {
             await sendPrivateImage(target.id, params.image, runtimeOptions.imageCacheDir);
           }
           return { content: [{ type: "text", text: "图片发送成功" }] };
+        } catch (e: any) {
+          return { content: [{ type: "text", text: `发送失败: ${e?.message}` }] };
+        }
+      },
+    });
+
+    api.registerTool({
+      name: "onebot_send_video",
+      description:
+        "通过 OneBot 发送视频。target 格式：user:QQ号 或 group:群号。video 为本地路径(file://)或 URL 或 base64://",
+      parameters: {
+        type: "object",
+        properties: {
+          target: { type: "string" },
+          video: { type: "string", description: "视频路径或 URL" },
+        },
+        required: ["target", "video"],
+      },
+      async execute(_id: string, params: { target: string; video: string }) {
+        const w = getWs();
+        if (!w || w.readyState !== WebSocket.OPEN) {
+          return { content: [{ type: "text", text: "OneBot 未连接" }] };
+        }
+        const runtimeOptions = getRuntimeOptions();
+        const target = resolveEffectiveToolTarget(params.target, runtimeOptions, (globalThis as any).__onebotApi?.logger);
+        if (!target) {
+          return { content: [{ type: "text", text: `目标格式错误: ${params.target}` }] };
+        }
+        try {
+          if (target.type === "group") {
+            await sendGroupVideo(target.id, params.video, runtimeOptions.videoCacheDir);
+          } else {
+            await sendPrivateVideo(target.id, params.video, runtimeOptions.videoCacheDir);
+          }
+          return { content: [{ type: "text", text: "视频发送成功" }] };
         } catch (e: any) {
           return { content: [{ type: "text", text: `发送失败: ${e?.message}` }] };
         }
@@ -1032,8 +1500,7 @@ export default function register(api: any): void {
         api.logger?.warn?.("[onebot] no config, service will not connect");
         return;
       }
-      const runtimeOptions = resolveOneBotRuntimeOptions(api.config);
-      startImageCacheCleanupLoop(runtimeOptions.imageCacheDir);
+      startMediaCacheCleanupLoop();
 
       try {
         if (config.type === "forward-websocket") {
@@ -1093,7 +1560,7 @@ export default function register(api: any): void {
         httpServer.close();
         httpServer = null;
       }
-      stopImageCacheCleanupLoop();
+      stopMediaCacheCleanupLoop();
       api.logger?.info?.("[onebot] service stopped");
     },
   });

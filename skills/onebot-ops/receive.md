@@ -6,9 +6,10 @@
 ## 入站消息处理
 
 1. 提取消息文本
-2. 判断是否满足回复条件
-3. 进入 OpenClaw runtime 生成回复
-4. 发送文本/图片（支持 `<qqimg>` 与 `payload.mediaUrl`）
+2. 群聊消息按日期落盘到 JSONL（可关闭）
+3. 判断是否满足回复条件
+4. 进入 OpenClaw runtime 生成回复
+5. 发送文本/图片/视频（支持 `<qqimg>`、`<qqvideo>` 与 `payload.mediaUrl(s)`）
 
 ## 错误处理
 

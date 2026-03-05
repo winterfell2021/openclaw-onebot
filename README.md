@@ -12,8 +12,11 @@
 - ✅ 正向 / 反向 WebSocket 连接
 - ✅ TUI 配置向导：`openclaw onebot setup`
 - ✅ 新成员入群欢迎
-- ✅ Agent 工具：`onebot_send_text`、`onebot_send_image`、`onebot_upload_file`
+- ✅ Agent 工具：`onebot_send_text`、`onebot_send_image`、`onebot_send_video`、`onebot_upload_file`
 - ✅ 回复文本内 `<qqimg>...</qqimg>` / `<qqimg>...</img>` 自动解析并发图
+- ✅ 回复文本内 `<qqvideo>...</qqvideo>` / `<qqvideo>...</video>` 自动解析并发视频
+- ✅ 群聊回复支持 `reply` 引用（不强制 @），且文本与首个媒体同条发送
+- ✅ 阶段流式可配置（`blockStreaming`）
 - ✅ 回复 emoji 可选（默认关闭）
 
 ## 安装
@@ -52,7 +55,19 @@ openclaw onebot setup
       "thinkingEmojiId": 60,
       "qqimgTagEnabled": true,
       "qqimgTagCloseVariants": ["qqimg", "img"],
+      "qqvideoTagEnabled": true,
+      "qqvideoTagCloseVariants": ["qqvideo", "video"],
+      "blockStreaming": true,
       "imageCacheDir": "/data/.openclaw/workspace/.onebot-image-cache",
+      "videoCacheDir": "/data/.openclaw/workspace/.onebot-video-cache",
+      "videoMaxBytes": 52428800,
+      "videoFailureFallback": "upload-file",
+      "autoDetectVideoFromMediaUrls": true,
+      "groupChatLogEnabled": true,
+      "groupChatLogDir": "/data/.openclaw/workspace/.onebot-group-chat-logs",
+      "groupChatLogTimeZone": "Asia/Shanghai",
+      "groupChatLogMaxTextLength": 2000,
+      "groupChatLogIncludeRawMessage": false,
       "groupIncrease": {
         "enabled": true,
         "message": "欢迎 {userId} 加入群聊！"
@@ -75,6 +90,19 @@ openclaw onebot setup
 <qqimg>/data/.openclaw/workspace/images/demo.png</qqimg>
 ```
 
+### `<qqvideo>` 使用示例
+
+```text
+这是视频
+<qqvideo>https://example.com/demo.mp4</qqvideo>
+```
+
+也支持本地路径：
+
+```text
+<qqvideo>/data/.openclaw/workspace/videos/demo.mp4</qqvideo>
+```
+
 ## NapCat 挂载要求
 
 如果要发送本地路径图片，OpenClaw 与 NapCat 需要共享同一路径。
@@ -94,6 +122,23 @@ openclaw onebot setup
 | `LAGRANGE_WS_PORT` | 端口 |
 | `LAGRANGE_WS_ACCESS_TOKEN` | 访问令牌 |
 | `ONEBOT_IMAGE_CACHE_DIR` | 图片缓存目录 |
+| `ONEBOT_VIDEO_CACHE_DIR` | 视频缓存目录 |
+| `ONEBOT_VIDEO_MAX_BYTES` | 视频大小限制（字节） |
+| `ONEBOT_VIDEO_CACHE_MAX_AGE_MS` | 视频缓存清理时间（毫秒） |
+| `ONEBOT_VIDEO_GIF_TIMEOUT_MS` | 转 GIF 超时时间（毫秒） |
+| `ONEBOT_GROUP_CHAT_LOG_DIR` | 群聊日志目录 |
+| `ONEBOT_GROUP_CHAT_LOG_TIME_ZONE` | 群聊日志按日分桶时区 |
+| `ONEBOT_GROUP_CHAT_LOG_MAX_TEXT_LENGTH` | 群聊日志文本截断长度 |
+
+## 群聊日志沉淀（用于后续 skill 分析）
+
+当 `groupChatLogEnabled=true` 时，插件会记录群聊消息（含未 @ 机器人的消息）到：
+
+```text
+/data/.openclaw/workspace/.onebot-group-chat-logs/<YYYY-MM-DD>/group-<群号>.jsonl
+```
+
+每行一条 JSON，包含 `groupId`、`userId`、`text`、`mentioned`、`ignoredByMention`、`imageSources` 等字段。
 
 ## Agent 工具
 
@@ -101,6 +146,7 @@ openclaw onebot setup
 |------|------|
 | `onebot_send_text` | 发送文本，target: `user:QQ号` 或 `group:群号` |
 | `onebot_send_image` | 发送图片，image: 路径/URL/base64/data URL |
+| `onebot_send_video` | 发送视频，video: 路径/URL/base64/data URL |
 | `onebot_upload_file` | 上传文件，file: 本地路径，name: 文件名 |
 
 ## 本地验证

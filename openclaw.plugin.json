@@ -1,7 +1,7 @@
 {
   "id": "onebot",
   "name": "OneBot Channel",
-  "version": "1.0.0",
+  "version": "1.2.1",
   "description": "OneBot v11 protocol channel (QQ/Lagrange.Core via WebSocket)",
   "author": "Lagrange.Onebot",
   "channels": ["onebot"],
@@ -44,6 +44,11 @@
         "items": { "type": "string" },
         "default": ["qqimg", "img"]
       },
+      "blockStreaming": {
+        "type": "boolean",
+        "default": true,
+        "description": "是否启用阶段流式发送（true=按思考阶段逐条发送，false=尽量合并后发送）"
+      },
       "imageCacheDir": {
         "type": "string",
         "description": "图片缓存目录（建议挂载到 OpenClaw 与 NapCat 共用路径）"
@@ -82,6 +87,7 @@
     "thinkingEmojiEnabled": { "label": "回复中表情提示" },
     "thinkingEmojiId": { "label": "临时表情ID", "placeholder": "60" },
     "qqimgTagEnabled": { "label": "启用<qqimg>标签" },
+    "blockStreaming": { "label": "阶段流式发送" },
     "imageCacheDir": { "label": "图片缓存目录", "placeholder": "/data/.openclaw/workspace/.onebot-image-cache" },
     "groupToolTargetPolicy": { "label": "群聊工具目标策略" },
     "imageFailureFallback": { "label": "图片失败兜底策略" },
