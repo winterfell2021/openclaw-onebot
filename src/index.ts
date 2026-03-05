@@ -8,18 +8,39 @@
 import WebSocket from "ws";
 import { createServer } from "http";
 import { AsyncLocalStorage } from "async_hooks";
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { cleanupImageCache, resolveImageForNapCat } from "./image";
 import { resolveOneBotRuntimeOptions, type OneBotRuntimeOptions } from "./options";
 import { resolveUploadFileName, shouldFallbackToFileUpload, toExistingLocalPath } from "./image-fallback";
 import { parseQqimgSegments } from "./qqimg";
 import { resolveToolTargetByPolicy, type OneBotTarget } from "./target-policy";
 import { parseOneBotInboundMessage, resolveInboundMediaForPrompt } from "./inbound-media";
+import { GroupMentionMediaCache } from "./group-media-cache";
 
 // 尝试加载 plugin-sdk（兼容 openclaw 与 clawdbot）- 懒加载
 let sdkLoaded = false;
 let buildPendingHistoryContextFromMap: any;
 let recordPendingHistoryEntry: any;
 let clearHistoryEntriesIfEnabled: any;
+const pluginVersion = resolvePluginVersion();
+
+function resolvePluginVersion(): string {
+  try {
+    const currentFilePath = fileURLToPath(import.meta.url);
+    const currentDir = dirname(currentFilePath);
+    const packageJsonPath = resolve(currentDir, "../package.json");
+    const pkg = JSON.parse(readFileSync(packageJsonPath, "utf-8"));
+    const version = pkg?.version;
+    if (typeof version === "string" && version.trim()) {
+      return version.trim();
+    }
+  } catch {
+    // ignore
+  }
+  return "unknown";
+}
 
 async function loadPluginSdk() {
   if (sdkLoaded) return;
@@ -164,9 +185,11 @@ let imageCacheCleanupTimer: ReturnType<typeof setInterval> | null = null;
 
 function startImageCacheCleanupLoop(cacheDir: string): void {
   stopImageCacheCleanupLoop();
-  cleanupImageCache(cacheDir);
+  const runtimeOptions = getRuntimeOptions();
+  cleanupImageCache(cacheDir, runtimeOptions.imageCacheMaxAgeMs);
   imageCacheCleanupTimer = setInterval(() => {
-    cleanupImageCache(cacheDir);
+    const latestOptions = getRuntimeOptions();
+    cleanupImageCache(cacheDir, latestOptions.imageCacheMaxAgeMs);
   }, 60 * 60 * 1000);
 }
 
@@ -353,7 +376,7 @@ async function sendImageWithFallback(target: OneBotTarget, image: string, imageC
     seg = parsed;
     primaryFileRef = extractFirstImageFileRef(parsed);
   } else {
-    primaryFileRef = await resolveImageForNapCat(image, cacheDir);
+    primaryFileRef = await resolveImageForNapCat(image, cacheDir, runtimeOptions.imageCacheMaxAgeMs);
     seg = [{ type: "image", data: { file: primaryFileRef } }];
   }
 
@@ -375,7 +398,11 @@ async function sendImageWithFallback(target: OneBotTarget, image: string, imageC
     let localPath = toExistingLocalPath(fallbackSource);
     if (!localPath) {
       try {
-        const resolved = await resolveImageForNapCat(fallbackSource, cacheDir);
+        const resolved = await resolveImageForNapCat(
+          fallbackSource,
+          cacheDir,
+          runtimeOptions.imageCacheMaxAgeMs,
+        );
         localPath = toExistingLocalPath(resolved);
       } catch {
         localPath = null;
@@ -458,6 +485,7 @@ async function uploadPrivateFileAction(userId: number, file: string, name: strin
 
 const DEFAULT_HISTORY_LIMIT = 20;
 const sessionHistories = new Map<string, Array<{ sender: string; body: string; timestamp: number; messageId: string }>>();
+const groupMentionMediaCache = new GroupMentionMediaCache();
 
 // ============ Channel 定义 ============
 
@@ -536,31 +564,57 @@ async function processInboundMessage(api: any, msg: OneBotMessage): Promise<void
   const inboundMedia = await resolveInboundMediaForPrompt(
     parsedInbound.imageSources,
     runtimeOptions.imageCacheDir,
+    runtimeOptions.imageCacheMaxAgeMs,
     api.logger,
   );
-  const hasInboundMedia = inboundMedia.paths.length > 0;
+  let effectiveInboundMedia = inboundMedia;
+  let hasEffectiveInboundMedia = inboundMedia.paths.length > 0;
   if (parsedInbound.imageSources.length > 0) {
     api.logger?.info?.(
       `[onebot] inbound image parsed: sources=${parsedInbound.imageSources.length} resolved=${inboundMedia.paths.length}`,
     );
   }
 
-  if (!messageText?.trim() && !hasInboundMedia) {
-    api.logger?.info?.(`[onebot] ignoring empty message`);
-    return;
-  }
-
   const isGroup = msg.message_type === "group";
   const selfId = msg.self_id ?? 0;
   const requireMention = (cfg?.channels?.onebot as any)?.requireMention ?? true;
+  const mentioned = isMentioned(msg, selfId);
+  const userId = msg.user_id!;
+  const groupId = msg.group_id;
 
-  if (isGroup && requireMention && !isMentioned(msg, selfId)) {
+  if (isGroup && requireMention && !mentioned) {
+    if (typeof groupId === "number" && typeof userId === "number" && hasEffectiveInboundMedia) {
+      const cached = groupMentionMediaCache.record(groupId, userId, effectiveInboundMedia);
+      if (cached) {
+        api.logger?.info?.(
+          `[onebot] cached inbound media for group:${groupId} user:${userId} count=${effectiveInboundMedia.paths.length}`,
+        );
+      }
+    }
     api.logger?.info?.(`[onebot] ignoring group message without @mention`);
     return;
   }
 
-  const userId = msg.user_id!;
-  const groupId = msg.group_id;
+  if (isGroup && requireMention && typeof groupId === "number" && typeof userId === "number" && hasEffectiveInboundMedia) {
+    groupMentionMediaCache.record(groupId, userId, effectiveInboundMedia);
+  }
+
+  if (isGroup && mentioned && !hasEffectiveInboundMedia && typeof groupId === "number" && typeof userId === "number") {
+    const cachedMedia = groupMentionMediaCache.consume(groupId, userId);
+    if (cachedMedia && cachedMedia.paths.length > 0) {
+      effectiveInboundMedia = cachedMedia;
+      hasEffectiveInboundMedia = true;
+      api.logger?.info?.(
+        `[onebot] attached cached media for group:${groupId} user:${userId} count=${cachedMedia.paths.length}`,
+      );
+    }
+  }
+
+  if (!messageText?.trim() && !hasEffectiveInboundMedia) {
+    api.logger?.info?.(`[onebot] ignoring empty message`);
+    return;
+  }
+
   const sessionId = isGroup
     ? `onebot:group:${groupId}`.toLowerCase()
     : `onebot:${userId}`.toLowerCase();
@@ -633,12 +687,12 @@ async function processInboundMessage(api: any, msg: OneBotMessage): Promise<void
   const ctxPayload = {
     Body: body,
     RawBody: messageText,
-    MediaPath: hasInboundMedia ? inboundMedia.paths[0] : undefined,
-    MediaUrl: hasInboundMedia ? inboundMedia.urls[0] : undefined,
-    MediaType: hasInboundMedia ? inboundMedia.types[0] : undefined,
-    MediaPaths: hasInboundMedia ? inboundMedia.paths : undefined,
-    MediaUrls: hasInboundMedia ? inboundMedia.urls : undefined,
-    MediaTypes: hasInboundMedia ? inboundMedia.types : undefined,
+    MediaPath: hasEffectiveInboundMedia ? effectiveInboundMedia.paths[0] : undefined,
+    MediaUrl: hasEffectiveInboundMedia ? effectiveInboundMedia.urls[0] : undefined,
+    MediaType: hasEffectiveInboundMedia ? effectiveInboundMedia.types[0] : undefined,
+    MediaPaths: hasEffectiveInboundMedia ? effectiveInboundMedia.paths : undefined,
+    MediaUrls: hasEffectiveInboundMedia ? effectiveInboundMedia.urls : undefined,
+    MediaTypes: hasEffectiveInboundMedia ? effectiveInboundMedia.types : undefined,
     From: isGroup ? `onebot:group:${groupId}` : `onebot:${userId}`,
     To:
       currentTarget.type === "group"
@@ -1044,5 +1098,5 @@ export default function register(api: any): void {
     },
   });
 
-  api.logger?.info?.("[onebot] plugin loaded");
+  api.logger?.info?.(`[onebot] plugin loaded (version=${pluginVersion})`);
 }

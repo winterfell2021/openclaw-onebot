@@ -130,6 +130,7 @@ export function parseOneBotInboundMessage(msg: OneBotInboundLike): ParsedOneBotI
 export async function resolveInboundMediaForPrompt(
   imageSources: string[],
   cacheDir: string,
+  cacheMaxAgeMs?: number,
   logger?: { warn?: (msg: string) => void },
 ): Promise<ResolvedInboundMedia> {
   const paths: string[] = [];
@@ -138,7 +139,7 @@ export async function resolveInboundMediaForPrompt(
 
   for (const source of dedupeStrings(imageSources)) {
     try {
-      const resolved = await resolveImageForNapCat(source, cacheDir);
+      const resolved = await resolveImageForNapCat(source, cacheDir, cacheMaxAgeMs);
       const pathValue = fileUriToPath(resolved);
       if (!isLikelyAbsolutePath(pathValue)) {
         logger?.warn?.(`[onebot] skip non-absolute inbound media path: ${pathValue}`);

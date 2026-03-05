@@ -3,7 +3,7 @@ import https from "https";
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from "fs";
 import { extname, join } from "path";
 
-const IMAGE_CACHE_MAX_AGE_MS = 60 * 60 * 1000;
+const DEFAULT_IMAGE_CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const DOWNLOAD_TIMEOUT_MS = 30000;
 
 function detectImageType(buf: Buffer): string | null {
@@ -128,7 +128,8 @@ function cacheLocalFileForNapCat(localPath: string, cacheDir: string): string {
   return toFileUri(cachedPath);
 }
 
-export function cleanupImageCache(cacheDir: string): void {
+export function cleanupImageCache(cacheDir: string, maxAgeMs = DEFAULT_IMAGE_CACHE_MAX_AGE_MS): void {
+  const effectiveMaxAgeMs = Number.isFinite(maxAgeMs) && maxAgeMs > 0 ? maxAgeMs : DEFAULT_IMAGE_CACHE_MAX_AGE_MS;
   try {
     const files = readdirSync(cacheDir);
     const now = Date.now();
@@ -136,7 +137,7 @@ export function cleanupImageCache(cacheDir: string): void {
       const fullPath = join(cacheDir, file);
       try {
         const st = statSync(fullPath);
-        if (st.isFile() && now - st.mtimeMs > IMAGE_CACHE_MAX_AGE_MS) {
+        if (st.isFile() && now - st.mtimeMs > effectiveMaxAgeMs) {
           unlinkSync(fullPath);
         }
       } catch {
@@ -148,13 +149,17 @@ export function cleanupImageCache(cacheDir: string): void {
   }
 }
 
-export async function resolveImageForNapCat(image: string, cacheDir: string): Promise<string> {
+export async function resolveImageForNapCat(
+  image: string,
+  cacheDir: string,
+  cacheMaxAgeMs?: number,
+): Promise<string> {
   const trimmed = String(image || "").trim();
   if (!trimmed) {
     throw new Error("图片地址不能为空");
   }
 
-  cleanupImageCache(cacheDir);
+  cleanupImageCache(cacheDir, cacheMaxAgeMs);
 
   if (/^https?:\/\//i.test(trimmed)) {
     const buf = await downloadUrl(trimmed);
