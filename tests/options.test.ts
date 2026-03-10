@@ -22,6 +22,7 @@ describe("resolveOneBotRuntimeOptions", () => {
     assert.equal(options.groupChatLogTimeZone, "Asia/Shanghai");
     assert.equal(options.groupChatLogMaxTextLength, 2000);
     assert.equal(options.groupChatLogIncludeRawMessage, false);
+    assert.equal(options.groupMentionMediaTtlMs, 24 * 60 * 60 * 1000);
     assert.equal(options.groupToolTargetPolicy, "force-current-group");
     assert.equal(options.imageFailureFallback, "upload-file");
     assert.equal(options.imageFailureFallbackNotice, false);
@@ -54,6 +55,7 @@ describe("resolveOneBotRuntimeOptions", () => {
           groupChatLogTimeZone: "UTC",
           groupChatLogMaxTextLength: 300,
           groupChatLogIncludeRawMessage: true,
+          groupMentionMediaTtlMs: 5000,
           groupToolTargetPolicy: "respect-target",
           imageFailureFallback: "none",
           imageFailureFallbackNotice: true,
@@ -83,6 +85,7 @@ describe("resolveOneBotRuntimeOptions", () => {
     assert.equal(options.groupChatLogTimeZone, "UTC");
     assert.equal(options.groupChatLogMaxTextLength, 300);
     assert.equal(options.groupChatLogIncludeRawMessage, true);
+    assert.equal(options.groupMentionMediaTtlMs, 5000);
     assert.equal(options.groupToolTargetPolicy, "respect-target");
     assert.equal(options.imageFailureFallback, "none");
     assert.equal(options.imageFailureFallbackNotice, true);

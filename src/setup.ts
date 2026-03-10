@@ -102,6 +102,7 @@ export async function runOneBotSetup(): Promise<void> {
     groupChatLogTimeZone: "Asia/Shanghai",
     groupChatLogMaxTextLength: 2000,
     groupChatLogIncludeRawMessage: false,
+    groupMentionMediaTtlMs: 86400000,
     groupToolTargetPolicy: "force-current-group",
     imageFailureFallback: "upload-file",
     imageFailureFallbackNotice: false,

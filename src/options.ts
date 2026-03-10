@@ -21,6 +21,7 @@ const DEFAULT_GROUP_CHAT_LOG_DIR = "/data/.openclaw/workspace/.onebot-group-chat
 const DEFAULT_GROUP_CHAT_LOG_TIME_ZONE = "Asia/Shanghai";
 const DEFAULT_GROUP_CHAT_LOG_MAX_TEXT_LENGTH = 2000;
 const DEFAULT_GROUP_CHAT_LOG_INCLUDE_RAW_MESSAGE = false;
+const DEFAULT_GROUP_MENTION_MEDIA_TTL_MS = 24 * 60 * 60 * 1000;
 
 export type GroupToolTargetPolicy = "force-current-group" | "respect-target";
 export type ImageFailureFallback = "none" | "upload-file";
@@ -48,6 +49,7 @@ export interface OneBotRuntimeOptions {
   groupChatLogTimeZone: string;
   groupChatLogMaxTextLength: number;
   groupChatLogIncludeRawMessage: boolean;
+  groupMentionMediaTtlMs: number;
   groupToolTargetPolicy: GroupToolTargetPolicy;
   imageFailureFallback: ImageFailureFallback;
   imageFailureFallbackNotice: boolean;
@@ -103,6 +105,13 @@ export function resolveOneBotRuntimeOptions(cfg: any): OneBotRuntimeOptions {
     Number.isFinite(rawGroupChatLogMaxTextLength) && rawGroupChatLogMaxTextLength > 0
       ? Math.floor(rawGroupChatLogMaxTextLength)
       : DEFAULT_GROUP_CHAT_LOG_MAX_TEXT_LENGTH;
+  const rawGroupMentionMediaTtlMs = Number(
+    onebotCfg.groupMentionMediaTtlMs || process.env.ONEBOT_GROUP_MENTION_MEDIA_TTL_MS,
+  );
+  const groupMentionMediaTtlMs =
+    Number.isFinite(rawGroupMentionMediaTtlMs) && rawGroupMentionMediaTtlMs > 0
+      ? Math.floor(rawGroupMentionMediaTtlMs)
+      : DEFAULT_GROUP_MENTION_MEDIA_TTL_MS;
 
   const closeVariants = Array.isArray(onebotCfg.qqimgTagCloseVariants)
     ? onebotCfg.qqimgTagCloseVariants
@@ -151,6 +160,7 @@ export function resolveOneBotRuntimeOptions(cfg: any): OneBotRuntimeOptions {
       onebotCfg.groupChatLogIncludeRawMessage === true
         ? true
         : DEFAULT_GROUP_CHAT_LOG_INCLUDE_RAW_MESSAGE,
+    groupMentionMediaTtlMs,
     groupToolTargetPolicy:
       onebotCfg.groupToolTargetPolicy === "respect-target"
         ? "respect-target"

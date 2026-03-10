@@ -68,6 +68,7 @@ openclaw onebot setup
       "groupChatLogTimeZone": "Asia/Shanghai",
       "groupChatLogMaxTextLength": 2000,
       "groupChatLogIncludeRawMessage": false,
+      "groupMentionMediaTtlMs": 86400000,
       "groupIncrease": {
         "enabled": true,
         "message": "欢迎 {userId} 加入群聊！"
@@ -129,6 +130,7 @@ openclaw onebot setup
 | `ONEBOT_GROUP_CHAT_LOG_DIR` | 群聊日志目录 |
 | `ONEBOT_GROUP_CHAT_LOG_TIME_ZONE` | 群聊日志按日分桶时区 |
 | `ONEBOT_GROUP_CHAT_LOG_MAX_TEXT_LENGTH` | 群聊日志文本截断长度 |
+| `ONEBOT_GROUP_MENTION_MEDIA_TTL_MS` | 群里“先发图再 @”图片缓存保留时长（毫秒） |
 
 ## 群聊日志沉淀（用于后续 skill 分析）
 
@@ -139,6 +141,13 @@ openclaw onebot setup
 ```
 
 每行一条 JSON，包含 `groupId`、`userId`、`text`、`mentioned`、`ignoredByMention`、`imageSources` 等字段。
+
+## 群里先发图再 @
+
+- `groupMentionMediaTtlMs` 默认是 `86400000`（24 小时）。
+- 群成员先单独发图片、后续再 `@` 机器人且当前消息本身不带图时，插件会按“**群号 + 用户号**”读取最近一组缓存图片。
+- 这组图片在 **24 小时内首次命中时一次性消费**，随后清空。
+- 同一用户发了新图会覆盖旧图，不会无限累计。
 
 ## Agent 工具
 

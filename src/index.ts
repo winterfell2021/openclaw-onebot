@@ -9,7 +9,7 @@ import WebSocket from "ws";
 import { createServer } from "http";
 import { AsyncLocalStorage } from "async_hooks";
 import { readFileSync } from "node:fs";
-import { basename, dirname, extname, resolve } from "node:path";
+import { basename, dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { cleanupImageCache, resolveImageForNapCat } from "./image";
 import { cleanupVideoCache, resolveVideoForNapCat } from "./video";
@@ -17,10 +17,12 @@ import { convertVideoToGif } from "./video-gif";
 import { resolveOneBotRuntimeOptions, type OneBotRuntimeOptions } from "./options";
 import { normalizeFileUriToPath, resolveUploadFileName, shouldFallbackToFileUpload, toExistingLocalPath } from "./image-fallback";
 import { parseQqMediaSegments } from "./qqmedia";
+import { mergeBufferedReplyText } from "./reply-text";
 import { appendGroupChatLog } from "./group-chat-log";
 import { resolveToolTargetByPolicy, type OneBotTarget } from "./target-policy";
 import { parseOneBotInboundMessage, resolveInboundMediaForPrompt } from "./inbound-media";
 import { GroupMentionMediaCache } from "./group-media-cache";
+import { GroupSharedContextStore } from "./group-shared-context";
 
 // 尝试加载 plugin-sdk（兼容 openclaw 与 clawdbot）- 懒加载
 let sdkLoaded = false;
@@ -73,6 +75,12 @@ interface OneBotMessage {
   message_id?: number;
   user_id?: number;
   group_id?: number;
+  sender?: {
+    card?: string;
+    nickname?: string;
+    user_id?: number;
+    [key: string]: unknown;
+  };
   message?: Array<{ type: string; data?: Record<string, unknown> }>;
   raw_message?: string;
   self_id?: number;
@@ -361,17 +369,10 @@ async function deliverTextWithQqMedia(
 ): Promise<void> {
   const cleaned = stripNoReplyMarker(text);
   if (!cleaned) return;
-
-  let pendingReplyToId: OutboundReplyId | null = normalizeReplyToId(replyToId) ?? null;
-  const consumeReplyToId = (): OutboundReplyId | undefined => {
-    if (pendingReplyToId === null) return undefined;
-    const value = pendingReplyToId;
-    pendingReplyToId = null;
-    return value;
-  };
+  const normalizedReplyToId = normalizeReplyToId(replyToId);
 
   if (!options.qqimgTagEnabled && !options.qqvideoTagEnabled) {
-    if (target.type === "group") await sendGroupMsg(target.id, cleaned, { replyToId: consumeReplyToId() });
+    if (target.type === "group") await sendGroupMsg(target.id, cleaned, { replyToId: normalizedReplyToId });
     else await sendPrivateMsg(target.id, cleaned);
     return;
   }
@@ -382,18 +383,17 @@ async function deliverTextWithQqMedia(
   });
   for (const item of queue) {
     try {
-      const currentReplyToId = consumeReplyToId();
       if (item.type === "text") {
-        if (target.type === "group") await sendGroupMsg(target.id, item.content, { replyToId: currentReplyToId });
+        if (target.type === "group") await sendGroupMsg(target.id, item.content, { replyToId: normalizedReplyToId });
         else await sendPrivateMsg(target.id, item.content);
       } else if (item.type === "image") {
         if (target.type === "group") {
-          await sendGroupImage(target.id, item.content, options.imageCacheDir, { replyToId: currentReplyToId });
+          await sendGroupImage(target.id, item.content, options.imageCacheDir, { replyToId: normalizedReplyToId });
         }
         else await sendPrivateImage(target.id, item.content, options.imageCacheDir);
       } else {
         if (target.type === "group") {
-          await sendGroupVideo(target.id, item.content, options.videoCacheDir, { replyToId: currentReplyToId });
+          await sendGroupVideo(target.id, item.content, options.videoCacheDir, { replyToId: normalizedReplyToId });
         }
         else await sendPrivateVideo(target.id, item.content, options.videoCacheDir);
       }
@@ -490,6 +490,14 @@ async function sendGroupMsg(groupId: number, text: string, options: OneBotSendOp
 
 function getRuntimeOptions(): OneBotRuntimeOptions {
   return resolveOneBotRuntimeOptions((globalThis as any).__onebotApi?.config);
+}
+
+function getGroupMentionMediaCache(runtimeOptions: OneBotRuntimeOptions): GroupMentionMediaCache {
+  if (!groupMentionMediaCache || groupMentionMediaCacheTtlMs !== runtimeOptions.groupMentionMediaTtlMs) {
+    groupMentionMediaCache = new GroupMentionMediaCache(runtimeOptions.groupMentionMediaTtlMs);
+    groupMentionMediaCacheTtlMs = runtimeOptions.groupMentionMediaTtlMs;
+  }
+  return groupMentionMediaCache;
 }
 
 function extractFirstImageFileRef(segments: any[]): string | null {
@@ -826,7 +834,171 @@ async function uploadPrivateFileAction(userId: number, file: string, name: strin
 
 const DEFAULT_HISTORY_LIMIT = 20;
 const sessionHistories = new Map<string, Array<{ sender: string; body: string; timestamp: number; messageId: string }>>();
-const groupMentionMediaCache = new GroupMentionMediaCache();
+let groupMentionMediaCache: GroupMentionMediaCache | null = null;
+let groupMentionMediaCacheTtlMs = 0;
+const DEFAULT_GROUP_SHARED_HISTORY_LIMIT = DEFAULT_HISTORY_LIMIT * 2;
+const GROUP_SHARED_CONTEXT_DIRNAME = ".onebot-group-shared-context";
+const STREAM_TEXT_FLUSH_DELAY_MS = 350;
+const groupSharedContextStores = new Map<string, GroupSharedContextStore>();
+
+function resolveExecutionSessionKey(
+  isGroup: boolean,
+  groupId: number | undefined,
+  userId: number,
+  inboundMessageId: number | undefined,
+  messageTimestampMs: number,
+): string {
+  if (!isGroup || typeof groupId !== "number") {
+    return `onebot:${userId}`.toLowerCase();
+  }
+  if (typeof inboundMessageId === "number") {
+    return `onebot:group:${groupId}:msg:${inboundMessageId}`.toLowerCase();
+  }
+  const randomSuffix = Math.random().toString(36).slice(2, 8);
+  return `onebot:group:${groupId}:user:${userId}:ts:${messageTimestampMs}:${randomSuffix}`.toLowerCase();
+}
+
+function resolveGroupSharedContextDir(runtimeOptions: OneBotRuntimeOptions): string {
+  return join(dirname(runtimeOptions.groupChatLogDir), GROUP_SHARED_CONTEXT_DIRNAME);
+}
+
+function getGroupSharedContextStore(runtimeOptions: OneBotRuntimeOptions): GroupSharedContextStore {
+  const rootDir = resolveGroupSharedContextDir(runtimeOptions);
+  let store = groupSharedContextStores.get(rootDir);
+  if (!store) {
+    store = new GroupSharedContextStore(rootDir, DEFAULT_GROUP_SHARED_HISTORY_LIMIT);
+    groupSharedContextStores.set(rootDir, store);
+  }
+  return store;
+}
+
+function normalizeCompactText(value: unknown, maxLength = 600): string {
+  const normalized = String(value ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!normalized) return "";
+  if (normalized.length <= maxLength) return normalized;
+  return `${normalized.slice(0, maxLength)}…`;
+}
+
+function mergeTextFragments(previous: string, incoming: string): string {
+  const next = normalizeCompactText(incoming, 1200);
+  if (!next) return previous;
+  if (!previous) return next;
+  if (next.includes(previous)) return next;
+  if (previous.includes(next)) return previous;
+  return `${previous}\n\n${next}`;
+}
+
+function normalizeSenderName(value: unknown): string {
+  return String(value ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function resolveSenderDisplayLabel(msg: OneBotMessage, userId: number): string {
+  const sender = msg.sender && typeof msg.sender === "object" ? msg.sender : undefined;
+  const card = normalizeSenderName(sender?.card);
+  const nickname = normalizeSenderName(sender?.nickname);
+  const preferred = card || nickname;
+  if (!preferred || preferred === String(userId)) {
+    return String(userId);
+  }
+  return `${preferred}（${userId}）`;
+}
+
+function buildInboundSharedBody(
+  messageText: string,
+  mediaCount: number,
+  quotedBody?: string,
+): string {
+  const parts: string[] = [];
+  const normalizedMessage = normalizeCompactText(messageText, 700);
+  const normalizedQuote = normalizeCompactText(quotedBody, 240);
+  if (normalizedQuote) {
+    parts.push(`引用：${normalizedQuote}`);
+  }
+  if (normalizedMessage) {
+    parts.push(normalizedMessage);
+  }
+  if (mediaCount > 0) {
+    parts.push(`附带图片 ${mediaCount} 张`);
+  }
+  if (parts.length === 0) {
+    return "发送了空白消息";
+  }
+  return parts.join("\n");
+}
+
+interface ReplySummaryAccumulator {
+  text: string;
+  imageCount: number;
+  videoCount: number;
+}
+
+function createReplySummaryAccumulator(): ReplySummaryAccumulator {
+  return {
+    text: "",
+    imageCount: 0,
+    videoCount: 0,
+  };
+}
+
+function appendReplySummary(
+  accumulator: ReplySummaryAccumulator,
+  replyText: string,
+  mediaCandidates: string[],
+  runtimeOptions: OneBotRuntimeOptions,
+): void {
+  accumulator.text = mergeTextFragments(accumulator.text, replyText);
+  for (const mediaUrl of mediaCandidates) {
+    const kind = resolveOutboundMediaKind(mediaUrl, runtimeOptions.autoDetectVideoFromMediaUrls);
+    if (kind === "video") accumulator.videoCount += 1;
+    else accumulator.imageCount += 1;
+  }
+}
+
+function buildReplySummary(accumulator: ReplySummaryAccumulator): string {
+  const parts: string[] = [];
+  const normalizedText = normalizeCompactText(accumulator.text, 900);
+  if (normalizedText) {
+    parts.push(normalizedText);
+  }
+  if (accumulator.imageCount > 0) {
+    parts.push(`发送图片 ${accumulator.imageCount} 张`);
+  }
+  if (accumulator.videoCount > 0) {
+    parts.push(`发送视频 ${accumulator.videoCount} 个`);
+  }
+  return parts.join("\n");
+}
+
+function hasReplySummaryContent(accumulator: ReplySummaryAccumulator): boolean {
+  return Boolean(normalizeCompactText(accumulator.text) || accumulator.imageCount > 0 || accumulator.videoCount > 0);
+}
+
+async function resolveQuotedMessageBody(
+  replyMessageId: string | number | undefined,
+  logger?: { warn?: (msg: string) => void },
+): Promise<string | undefined> {
+  const normalizedReplyId = normalizeReplyToId(replyMessageId);
+  const w = ws;
+  if (!normalizedReplyId || !w || w.readyState !== WebSocket.OPEN) {
+    return undefined;
+  }
+
+  try {
+    const response = await sendOneBotAction(w, "get_msg", {
+      message_id: normalizedReplyId,
+    });
+    const messageData = response?.data && typeof response.data === "object" ? response.data : response;
+    const quoted = parseOneBotInboundMessage(messageData as any);
+    return buildInboundSharedBody(quoted.text, quoted.imageSources.length);
+  } catch (err: any) {
+    logger?.warn?.(`[onebot] resolve quoted message failed: ${err?.message || err}`);
+    return undefined;
+  }
+}
 
 // ============ Channel 定义 ============
 
@@ -948,6 +1120,7 @@ async function processInboundMessage(api: any, msg: OneBotMessage): Promise<void
 
   const cfg = api.config;
   const runtimeOptions = resolveOneBotRuntimeOptions(cfg);
+  const mentionMediaCache = getGroupMentionMediaCache(runtimeOptions);
   const parsedInbound = parseOneBotInboundMessage(msg);
   const messageText = parsedInbound.text;
   const inboundMedia = await resolveInboundMediaForPrompt(
@@ -1006,7 +1179,7 @@ async function processInboundMessage(api: any, msg: OneBotMessage): Promise<void
 
   if (ignoredByMention) {
     if (typeof groupId === "number" && typeof userId === "number" && hasEffectiveInboundMedia) {
-      const cached = groupMentionMediaCache.record(groupId, userId, effectiveInboundMedia);
+      const cached = mentionMediaCache.record(groupId, userId, effectiveInboundMedia);
       if (cached) {
         api.logger?.info?.(
           `[onebot] cached inbound media for group:${groupId} user:${userId} count=${effectiveInboundMedia.paths.length}`,
@@ -1018,11 +1191,11 @@ async function processInboundMessage(api: any, msg: OneBotMessage): Promise<void
   }
 
   if (isGroup && requireMention && typeof groupId === "number" && typeof userId === "number" && hasEffectiveInboundMedia) {
-    groupMentionMediaCache.record(groupId, userId, effectiveInboundMedia);
+    mentionMediaCache.record(groupId, userId, effectiveInboundMedia);
   }
 
   if (isGroup && mentioned && !hasEffectiveInboundMedia && typeof groupId === "number" && typeof userId === "number") {
-    const cachedMedia = groupMentionMediaCache.consume(groupId, userId);
+    const cachedMedia = mentionMediaCache.consume(groupId, userId);
     if (cachedMedia && cachedMedia.paths.length > 0) {
       effectiveInboundMedia = cachedMedia;
       hasEffectiveInboundMedia = true;
@@ -1032,18 +1205,27 @@ async function processInboundMessage(api: any, msg: OneBotMessage): Promise<void
     }
   }
 
-  if (!messageText?.trim() && !hasEffectiveInboundMedia) {
+  const inboundMessageId = typeof msg.message_id === "number" ? msg.message_id : undefined;
+  const replyMessageId = normalizeReplyToId(parsedInbound.replyMessageId);
+  const quotedBody = await resolveQuotedMessageBody(replyMessageId, api.logger);
+  if (!messageText?.trim() && !hasEffectiveInboundMedia && !quotedBody?.trim()) {
     api.logger?.info?.(`[onebot] ignoring empty message`);
     return;
   }
-
-  const sessionId = isGroup
-    ? `onebot:group:${groupId}`.toLowerCase()
-    : `onebot:${userId}`.toLowerCase();
+  const sharedGroupKey =
+    isGroup && typeof groupId === "number" ? `onebot:group:${groupId}`.toLowerCase() : undefined;
+  const sessionId = resolveExecutionSessionKey(
+    isGroup,
+    groupId,
+    userId,
+    inboundMessageId,
+    messageTimestampMs,
+  );
+  const routeSessionKey = sharedGroupKey ?? sessionId;
 
   const route = runtime.channel.routing?.resolveAgentRoute?.({
     cfg,
-    sessionKey: sessionId,
+    sessionKey: routeSessionKey,
     channel: "onebot",
     accountId: config.accountId ?? "default",
   }) ?? { agentId: "main" };
@@ -1056,43 +1238,78 @@ async function processInboundMessage(api: any, msg: OneBotMessage): Promise<void
   const envelopeOptions = runtime.channel.reply?.resolveEnvelopeFormatOptions?.(cfg) ?? {};
   const chatType = isGroup ? "group" : "direct";
   const fromLabel = String(userId);
+  const senderDisplayLabel = resolveSenderDisplayLabel(msg, userId);
   const currentTarget: OneBotTarget =
     isGroup && groupId ? { type: "group", id: groupId } : { type: "user", id: userId };
   const conversationLabel =
     currentTarget.type === "group" ? `group:${currentTarget.id}` : `user:${currentTarget.id}`;
   const routeTo = `${currentTarget.type}:${currentTarget.id}`;
+  let promptBody = messageText || quotedBody || "";
+  let groupSharedContextInfo:
+    | {
+        store: GroupSharedContextStore;
+        groupId: number;
+        executionKey: string;
+        currentText: string;
+      }
+    | null = null;
+
+  if (isGroup && sharedGroupKey && typeof groupId === "number") {
+    const sharedStore = getGroupSharedContextStore(runtimeOptions);
+    const sharedTurn = sharedStore.beginTurn({
+      groupId,
+      executionKey: sessionId,
+      senderLabel: senderDisplayLabel,
+      userId,
+      messageId: inboundMessageId != null ? String(inboundMessageId) : sessionId,
+      timestamp: messageTimestampMs,
+      text: messageText,
+      imageCount: effectiveInboundMedia.paths.length,
+      replyText: quotedBody,
+    });
+    promptBody = sharedTurn.promptContext;
+    groupSharedContextInfo = {
+      store: sharedStore,
+      groupId,
+      executionKey: sessionId,
+      currentText: sharedTurn.currentText,
+    };
+  }
 
   const formattedBody =
     runtime.channel.reply?.formatInboundEnvelope?.({
       channel: "OneBot",
       from: fromLabel,
       timestamp: Date.now(),
-      body: messageText,
+      body: promptBody,
       chatType,
-      sender: { name: fromLabel, id: String(userId) },
+      sender: { name: senderDisplayLabel, id: String(userId) },
       envelope: envelopeOptions,
-    }) ?? { content: [{ type: "text", text: messageText }] };
+    }) ?? { content: [{ type: "text", text: promptBody }] };
 
-  const body = buildPendingHistoryContextFromMap
-    ? buildPendingHistoryContextFromMap({
-        historyMap: sessionHistories,
-        historyKey: sessionId,
-        limit: DEFAULT_HISTORY_LIMIT,
-        currentMessage: formattedBody,
-        formatEntry: (entry: any) =>
-          runtime.channel.reply?.formatInboundEnvelope?.({
-            channel: "OneBot",
-            from: fromLabel,
-            timestamp: entry.timestamp,
-            body: entry.body,
-            chatType,
-            senderLabel: entry.sender,
-            envelope: envelopeOptions,
-          }) ?? { content: [{ type: "text", text: entry.body }] },
-      })
-    : formattedBody;
+  const formatHistoryEntry = (entry: any) =>
+    runtime.channel.reply?.formatInboundEnvelope?.({
+      channel: "OneBot",
+      from: fromLabel,
+      timestamp: entry.timestamp,
+      body: entry.body,
+      chatType,
+      senderLabel: entry.sender,
+      envelope: envelopeOptions,
+    }) ?? { content: [{ type: "text", text: entry.body }] };
 
-  if (recordPendingHistoryEntry) {
+  const body =
+    !isGroup && buildPendingHistoryContextFromMap
+        ? buildPendingHistoryContextFromMap({
+            historyMap: sessionHistories,
+            historyKey: sessionId,
+            limit: DEFAULT_HISTORY_LIMIT,
+            currentMessage: formattedBody,
+            formatEntry: formatHistoryEntry,
+          })
+        : formattedBody;
+
+  if (!isGroup && recordPendingHistoryEntry) {
     recordPendingHistoryEntry({
       historyMap: sessionHistories,
       historyKey: sessionId,
@@ -1108,7 +1325,8 @@ async function processInboundMessage(api: any, msg: OneBotMessage): Promise<void
 
   const ctxPayload = {
     Body: body,
-    RawBody: messageText,
+    BodyForAgent: promptBody,
+    RawBody: messageText || groupSharedContextInfo?.currentText || quotedBody || "",
     MediaPath: hasEffectiveInboundMedia ? effectiveInboundMedia.paths[0] : undefined,
     MediaUrl: hasEffectiveInboundMedia ? effectiveInboundMedia.urls[0] : undefined,
     MediaType: hasEffectiveInboundMedia ? effectiveInboundMedia.types[0] : undefined,
@@ -1121,6 +1339,7 @@ async function processInboundMessage(api: any, msg: OneBotMessage): Promise<void
         ? `onebot:group:${currentTarget.id}`
         : `onebot:${currentTarget.id}`,
     SessionKey: sessionId,
+    ParentSessionKey: sharedGroupKey,
     AccountId: config.accountId ?? "default",
     ChatType: chatType,
     ConversationLabel: conversationLabel,
@@ -1128,7 +1347,10 @@ async function processInboundMessage(api: any, msg: OneBotMessage): Promise<void
     SenderId: String(userId),
     Provider: "onebot",
     Surface: "onebot",
-    MessageSid: `onebot-${Date.now()}`,
+    MessageSid: inboundMessageId != null ? String(inboundMessageId) : `onebot-${Date.now()}`,
+    ReplyToId: replyMessageId,
+    ReplyToBody: quotedBody,
+    ReplyToIsQuote: quotedBody ? true : undefined,
     Timestamp: Date.now(),
     OriginatingChannel: "onebot",
     OriginatingTo:
@@ -1136,7 +1358,7 @@ async function processInboundMessage(api: any, msg: OneBotMessage): Promise<void
         ? `onebot:group:${currentTarget.id}`
         : `onebot:${currentTarget.id}`,
     CommandAuthorized: true,
-    _onebot: { userId, groupId, isGroup },
+    _onebot: { userId, groupId, isGroup, sharedGroupKey },
   };
 
   if (runtime.channel.session?.recordInboundSession) {
@@ -1145,7 +1367,7 @@ async function processInboundMessage(api: any, msg: OneBotMessage): Promise<void
       sessionKey: sessionId,
       ctx: ctxPayload,
       updateLastRoute: {
-        sessionKey: sessionId,
+        sessionKey: routeSessionKey,
         channel: "onebot",
         to: routeTo,
         accountId: config.accountId ?? "default",
@@ -1158,7 +1380,6 @@ async function processInboundMessage(api: any, msg: OneBotMessage): Promise<void
     runtime.channel.activity.record({ channel: "onebot", accountId: config.accountId ?? "default", direction: "inbound" });
   }
 
-  const inboundMessageId = typeof msg.message_id === "number" ? msg.message_id : undefined;
   const groupReplyToId = isGroup && inboundMessageId != null ? inboundMessageId : undefined;
   let emojiAdded = false;
   const clearEmojiReaction = async () => {
@@ -1180,6 +1401,97 @@ async function processInboundMessage(api: any, msg: OneBotMessage): Promise<void
       api.logger?.warn?.(`[onebot] set thinking emoji failed: ${err?.message || err}`);
     }
   }
+
+  const replySummaryAccumulator = createReplySummaryAccumulator();
+  let fullReplyTextParts: string[] = [];
+  let sharedContextFinalized = false;
+  let bufferedReplyText = "";
+  let bufferedReplyFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  let bufferedReplyFlushPromise: Promise<void> | null = null;
+  let resolveBufferedReplyFlush: (() => void) | null = null;
+
+  const clearBufferedReplyFlushHandle = (): (() => void) | null => {
+    if (bufferedReplyFlushTimer) {
+      clearTimeout(bufferedReplyFlushTimer);
+      bufferedReplyFlushTimer = null;
+    }
+    const resolver = resolveBufferedReplyFlush;
+    bufferedReplyFlushPromise = null;
+    resolveBufferedReplyFlush = null;
+    return resolver;
+  };
+
+  const flushBufferedReplyText = async (): Promise<void> => {
+    const text = bufferedReplyText;
+    bufferedReplyText = "";
+    const resolver = clearBufferedReplyFlushHandle();
+    if (!text) {
+      resolver?.();
+      return;
+    }
+    try {
+      await clearEmojiReaction();
+      await deliverTextWithQqMedia(text, currentTarget, runtimeOptions, api.logger, groupReplyToId);
+    } finally {
+      resolver?.();
+    }
+  };
+
+  const scheduleBufferedReplyText = (text: string): void => {
+    bufferedReplyText = mergeBufferedReplyText(bufferedReplyText, text);
+    if (!bufferedReplyFlushPromise) {
+      bufferedReplyFlushPromise = new Promise<void>((resolve) => {
+        resolveBufferedReplyFlush = resolve;
+      });
+    }
+    if (bufferedReplyFlushTimer) {
+      clearTimeout(bufferedReplyFlushTimer);
+    }
+    bufferedReplyFlushTimer = setTimeout(() => {
+      void flushBufferedReplyText();
+    }, STREAM_TEXT_FLUSH_DELAY_MS);
+  };
+
+  const waitBufferedReplyFlush = async (): Promise<void> => {
+    if (bufferedReplyFlushPromise) {
+      await bufferedReplyFlushPromise;
+    }
+  };
+
+  const finalizeSharedContext = async (replyBody: string): Promise<void> => {
+    if (!groupSharedContextInfo || sharedContextFinalized) return;
+    sharedContextFinalized = true;
+    groupSharedContextInfo.store.completeTurn({
+      groupId: groupSharedContextInfo.groupId,
+      executionKey: groupSharedContextInfo.executionKey,
+      assistantText: replyBody,
+      completedAt: Date.now(),
+    });
+  };
+
+  const buildFullReplyForSharedContext = (): string => {
+    const parts: string[] = [];
+    const joined = fullReplyTextParts.join("\n\n").trim();
+    if (joined) parts.push(joined);
+    if (replySummaryAccumulator.imageCount > 0) {
+      parts.push(`发送图片 ${replySummaryAccumulator.imageCount} 张`);
+    }
+    if (replySummaryAccumulator.videoCount > 0) {
+      parts.push(`发送视频 ${replySummaryAccumulator.videoCount} 个`);
+    }
+    return parts.join("\n");
+  };
+
+  const failSharedContext = async (reason: string): Promise<void> => {
+    if (!groupSharedContextInfo || sharedContextFinalized) return;
+    sharedContextFinalized = true;
+    groupSharedContextInfo.store.completeTurn({
+      groupId: groupSharedContextInfo.groupId,
+      executionKey: groupSharedContextInfo.executionKey,
+      assistantText: reason,
+      completedAt: Date.now(),
+    });
+  };
 
   api.logger?.info?.(`[onebot] dispatching message for session ${sessionId}`);
 
@@ -1208,48 +1520,75 @@ async function processInboundMessage(api: any, msg: OneBotMessage): Promise<void
                   : []),
                 ...(typeof payload.mediaUrl === "string" && payload.mediaUrl.trim() ? [payload.mediaUrl] : []),
               ];
-              if (!replyText && mediaCandidates.length === 0) return;
+              if (!replyText && mediaCandidates.length === 0) {
+                if (info.kind === "final") {
+                  await flushBufferedReplyText();
+                  if (!isGroup && clearHistoryEntriesIfEnabled) {
+                    clearHistoryEntriesIfEnabled({
+                      historyMap: sessionHistories,
+                      historyKey: sessionId,
+                      limit: DEFAULT_HISTORY_LIMIT,
+                    });
+                  }
+                  await finalizeSharedContext("");
+                }
+                return;
+              }
 
-              await clearEmojiReaction();
-              const { userId: uid, groupId: gid, isGroup: ig } = (ctxPayload as any)._onebot || {};
-              const target =
-                ig && gid ? ({ type: "group", id: gid } as const) : uid ? ({ type: "user", id: uid } as const) : null;
-              if (!target) return;
+              appendReplySummary(replySummaryAccumulator, replyText, mediaCandidates, runtimeOptions);
+              if (replyText) fullReplyTextParts.push(replyText);
+
               try {
                 if (mediaCandidates.length === 0) {
                   if (replyText) {
-                    await deliverTextWithQqMedia(
-                      replyText,
-                      target,
-                      runtimeOptions,
-                      api.logger,
-                      groupReplyToId,
-                    );
+                    if (info.kind === "final") {
+                      scheduleBufferedReplyText(replyText);
+                      await waitBufferedReplyFlush();
+                    } else {
+                      scheduleBufferedReplyText(replyText);
+                    }
                   }
                 } else {
+                  await flushBufferedReplyText();
                   let isFirstMedia = true;
                   for (const mediaUrl of mediaCandidates) {
-                    await sendMediaByKind(target, mediaUrl, runtimeOptions, {
+                    await clearEmojiReaction();
+                    await sendMediaByKind(currentTarget, mediaUrl, runtimeOptions, {
                       caption: isFirstMedia ? replyText : "",
-                      replyToId: isFirstMedia ? groupReplyToId : undefined,
+                      replyToId: groupReplyToId,
                     });
                     isFirstMedia = false;
                   }
                 }
-                if (info.kind === "final" && clearHistoryEntriesIfEnabled) {
-                  clearHistoryEntriesIfEnabled({
-                    historyMap: sessionHistories,
-                    historyKey: sessionId,
-                    limit: DEFAULT_HISTORY_LIMIT,
-                  });
+                if (info.kind === "final") {
+                  await flushBufferedReplyText();
+                  if (!isGroup && clearHistoryEntriesIfEnabled) {
+                    clearHistoryEntriesIfEnabled({
+                      historyMap: sessionHistories,
+                      historyKey: sessionId,
+                      limit: DEFAULT_HISTORY_LIMIT,
+                    });
+                  }
+                  await finalizeSharedContext(buildFullReplyForSharedContext());
                 }
               } catch (e: any) {
                 api.logger?.error?.(`[onebot] deliver failed: ${e?.message}`);
+                const fullText = buildFullReplyForSharedContext();
+                const failureSummary = fullText
+                  ? `${fullText}\n处理失败：${normalizeCompactText(e?.message || e, 240)}`
+                  : `处理失败：${normalizeCompactText(e?.message || e, 240)}`;
+                await failSharedContext(failureSummary);
               }
             },
             onError: async (err: any, info: any) => {
+              await flushBufferedReplyText();
               await clearEmojiReaction();
               api.logger?.error?.(`[onebot] ${info?.kind} reply failed: ${err}`);
+              const fullText = buildFullReplyForSharedContext();
+              const failureSummary = fullText
+                ? `${fullText}\n处理失败：${normalizeCompactText(err?.message || err, 240)}`
+                : `处理失败：${normalizeCompactText(err?.message || err, 240)}`;
+              await failSharedContext(failureSummary);
             },
           },
           replyOptions: { disableBlockStreaming: !runtimeOptions.blockStreaming },
@@ -1257,14 +1596,32 @@ async function processInboundMessage(api: any, msg: OneBotMessage): Promise<void
       },
     );
   } catch (err: any) {
+    await flushBufferedReplyText();
     await clearEmojiReaction();
     api.logger?.error?.(`[onebot] dispatch failed: ${err?.message}`);
     try {
       const { userId: uid, groupId: gid, isGroup: ig } = (ctxPayload as any)._onebot || {};
-      if (ig && gid) await sendGroupMsg(gid, `处理失败: ${err?.message?.slice(0, 80) || "未知错误"}`);
+      if (ig && gid) {
+        await sendGroupMsg(gid, `处理失败: ${err?.message?.slice(0, 80) || "未知错误"}`, {
+          replyToId: groupReplyToId,
+        });
+      }
       else if (uid) await sendPrivateMsg(uid, `处理失败: ${err?.message?.slice(0, 80) || "未知错误"}`);
     } catch (_) {}
+    const fullText = buildFullReplyForSharedContext();
+    const failureSummary = fullText
+      ? `${fullText}\n处理失败：${normalizeCompactText(err?.message || err, 240)}`
+      : `处理失败：${normalizeCompactText(err?.message || err, 240)}`;
+    await failSharedContext(failureSummary);
   } finally {
+    await flushBufferedReplyText();
+    if (groupSharedContextInfo && !sharedContextFinalized) {
+      await finalizeSharedContext(
+        fullReplyTextParts.length > 0 || hasReplySummaryContent(replySummaryAccumulator)
+          ? buildFullReplyForSharedContext()
+          : "",
+      );
+    }
     await clearEmojiReaction();
   }
 }

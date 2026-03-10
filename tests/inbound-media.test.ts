@@ -40,6 +40,47 @@ describe("parseOneBotInboundMessage", () => {
 
     assert.equal(parsed.text, "[CQ:image,file=foo.jpg,url=https://example.com/b.jpg]");
     assert.deepEqual(parsed.imageSources, ["https://example.com/b.jpg"]);
+    assert.equal(parsed.replyMessageId, undefined);
+  });
+
+  it("可解析 reply 段的消息 id", () => {
+    const parsed = parseOneBotInboundMessage({
+      message: [
+        { type: "reply", data: { id: "123456" } },
+        { type: "text", data: { text: "@机器人 看这个" } },
+      ],
+    });
+
+    assert.equal(parsed.replyMessageId, 123456);
+    assert.equal(parsed.text, "@机器人 看这个");
+    assert.deepEqual(parsed.imageSources, []);
+  });
+
+  it("混合 text image reply 时保持兼容", () => {
+    const parsed = parseOneBotInboundMessage({
+      message: [
+        { type: "reply", data: { message_id: 9988 } },
+        { type: "text", data: { text: "这个图呢" } },
+        { type: "image", data: { file: "https://example.com/d.png" } },
+      ],
+      raw_message: "[CQ:reply,id=9988]这个图呢[CQ:image,file=d.png,url=https://example.com/d.png]",
+    });
+
+    assert.equal(parsed.replyMessageId, 9988);
+    assert.equal(parsed.text, "这个图呢");
+    assert.deepEqual(parsed.imageSources, ["https://example.com/d.png"]);
+  });
+
+  it("reply 消息 id 为非数字字符串时也可保留原值", () => {
+    const parsed = parseOneBotInboundMessage({
+      message: [
+        { type: "reply", data: { message_id: "abc-42" } },
+        { type: "text", data: { text: "引用字符串 id" } },
+      ],
+    });
+
+    assert.equal(parsed.replyMessageId, "abc-42");
+    assert.equal(parsed.text, "引用字符串 id");
   });
 });
 

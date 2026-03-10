@@ -15,6 +15,7 @@ type OneBotInboundLike = {
 export interface ParsedOneBotInboundMessage {
   text: string;
   imageSources: string[];
+  replyMessageId?: string | number;
 }
 
 export interface ResolvedInboundMedia {
@@ -47,6 +48,28 @@ function parseImageSourceFromSegment(data: Record<string, unknown> | undefined):
     if (trimmed) return trimmed;
   }
   return null;
+}
+
+function parseReplyMessageId(data: Record<string, unknown> | undefined): string | number | undefined {
+  if (!data) return undefined;
+  const candidates = [data.id, data.message_id, data.messageId];
+  for (const value of candidates) {
+    if (typeof value === "number" && Number.isSafeInteger(value) && value > 0) {
+      return value;
+    }
+    if (typeof value === "string") {
+      const trimmed = value.trim();
+      if (!trimmed) continue;
+      if (/^\d+$/.test(trimmed)) {
+        const num = Number(trimmed);
+        if (Number.isSafeInteger(num) && num > 0) {
+          return num;
+        }
+      }
+      return trimmed;
+    }
+  }
+  return undefined;
 }
 
 function parseCqImageSources(rawMessage: string): string[] {
@@ -97,9 +120,14 @@ export function parseOneBotInboundMessage(msg: OneBotInboundLike): ParsedOneBotI
   const arr = Array.isArray(msg.message) ? msg.message : [];
   const textParts: string[] = [];
   const imageSources: string[] = [];
+  let replyMessageId: string | number | undefined;
 
   for (const segment of arr) {
     if (!segment || typeof segment !== "object") continue;
+    if (segment.type === "reply") {
+      replyMessageId = parseReplyMessageId(segment.data) ?? replyMessageId;
+      continue;
+    }
     if (segment.type === "text") {
       const value = segment.data?.text;
       if (typeof value === "string" && value) {
@@ -124,6 +152,7 @@ export function parseOneBotInboundMessage(msg: OneBotInboundLike): ParsedOneBotI
   return {
     text: textFromSegments || rawTextFallback,
     imageSources: dedupeStrings([...imageSources, ...parsedCqImageSources]),
+    replyMessageId,
   };
 }
 
