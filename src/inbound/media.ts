@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 import { extname } from "node:path";
-import { resolveImageForNapCat } from "./image";
+import { resolveImageForNapCat } from "../media/image";
 
 type OneBotSegment = {
   type?: string;
@@ -10,12 +10,22 @@ type OneBotSegment = {
 type OneBotInboundLike = {
   message?: OneBotSegment[];
   raw_message?: string;
+  self_id?: number;
 };
+
+export interface InboundFileInfo {
+  name: string;
+  size?: number;
+  url?: string;
+  fileId?: string;
+}
 
 export interface ParsedOneBotInboundMessage {
   text: string;
   imageSources: string[];
   replyMessageId?: string | number;
+  fileInfos: InboundFileInfo[];
+  forwardId?: string;
 }
 
 export interface ResolvedInboundMedia {
@@ -118,14 +128,30 @@ function inferImageMimeType(pathValue: string): string {
 
 export function parseOneBotInboundMessage(msg: OneBotInboundLike): ParsedOneBotInboundMessage {
   const arr = Array.isArray(msg.message) ? msg.message : [];
+  const selfId = msg.self_id;
+  const selfStr = selfId != null ? String(selfId) : "";
   const textParts: string[] = [];
   const imageSources: string[] = [];
+  const fileInfos: InboundFileInfo[] = [];
   let replyMessageId: string | number | undefined;
+  let forwardId: string | undefined;
 
   for (const segment of arr) {
     if (!segment || typeof segment !== "object") continue;
     if (segment.type === "reply") {
       replyMessageId = parseReplyMessageId(segment.data) ?? replyMessageId;
+      continue;
+    }
+    if (segment.type === "forward") {
+      const id = String(segment.data?.id ?? segment.data?.resid ?? "").trim();
+      if (id) forwardId = id;
+      continue;
+    }
+    if (segment.type === "at") {
+      const qq = String(segment.data?.qq ?? segment.data?.id ?? "").trim();
+      if (!qq || qq === selfStr) continue;
+      const name = String(segment.data?.name ?? "").trim();
+      textParts.push(name && name !== qq ? `@${name}（${qq}）` : `@${qq}`);
       continue;
     }
     if (segment.type === "text") {
@@ -138,6 +164,22 @@ export function parseOneBotInboundMessage(msg: OneBotInboundLike): ParsedOneBotI
     if (segment.type === "image") {
       const source = parseImageSourceFromSegment(segment.data);
       if (source) imageSources.push(source);
+      continue;
+    }
+    if (segment.type === "file") {
+      const data = segment.data;
+      if (data) {
+        const name = String(data.name ?? data.file_name ?? data.file ?? "").trim();
+        const url = typeof data.url === "string" ? data.url.trim() : undefined;
+        const fileId = typeof data.file_id === "string" ? data.file_id.trim() :
+                       typeof data.file === "string" ? data.file.trim() : undefined;
+        const size = typeof data.size === "number" ? data.size :
+                     typeof data.file_size === "number" ? data.file_size as number : undefined;
+        if (name || url || fileId) {
+          fileInfos.push({ name: name || "unknown", size, url: url || undefined, fileId: fileId || undefined });
+        }
+      }
+      continue;
     }
   }
 
@@ -153,6 +195,8 @@ export function parseOneBotInboundMessage(msg: OneBotInboundLike): ParsedOneBotI
     text: textFromSegments || rawTextFallback,
     imageSources: dedupeStrings([...imageSources, ...parsedCqImageSources]),
     replyMessageId,
+    fileInfos,
+    forwardId,
   };
 }
 
@@ -179,7 +223,7 @@ export async function resolveInboundMediaForPrompt(
         continue;
       }
       paths.push(pathValue);
-      urls.push(source);
+      urls.push(resolved.startsWith("file://") ? resolved : `file://${pathValue}`);
       types.push(inferImageMimeType(pathValue));
     } catch (err: any) {
       logger?.warn?.(

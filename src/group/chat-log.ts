@@ -22,6 +22,8 @@ export interface GroupChatLogEntry {
   rawMessage?: string;
   imageSources: string[];
   resolvedMediaCount: number;
+  senderLabel?: string;
+  cachedImagePaths?: string[];
 }
 
 function resolvePositiveInt(value: number, fallback: number): number {
@@ -78,6 +80,10 @@ export async function appendGroupChatLog(entry: GroupChatLogEntry, options: Grou
     text: trimWithLimit(entry.text, maxLength),
     imageSources: entry.imageSources.slice(0, 20),
     resolvedMediaCount: entry.resolvedMediaCount,
+    senderLabel: entry.senderLabel || undefined,
+    cachedImagePaths: entry.cachedImagePaths && entry.cachedImagePaths.length > 0
+      ? entry.cachedImagePaths
+      : undefined,
   };
 
   if (options.includeRawMessage && entry.rawMessage) {

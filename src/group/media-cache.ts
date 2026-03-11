@@ -1,4 +1,4 @@
-import type { ResolvedInboundMedia } from "./inbound-media";
+import type { ResolvedInboundMedia } from "../inbound/media";
 
 const DEFAULT_TTL_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_MAX_ENTRIES = 200;

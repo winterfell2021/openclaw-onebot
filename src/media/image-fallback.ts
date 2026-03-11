@@ -1,6 +1,6 @@
 import { existsSync } from "fs";
 import { basename } from "path";
-import type { ImageFailureFallback } from "./options";
+import type { ImageFailureFallback } from "../options";
 
 function errorMessage(err: unknown): string {
   if (err instanceof Error) return err.message;

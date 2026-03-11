@@ -22,7 +22,7 @@ describe("resolveOneBotRuntimeOptions", () => {
     assert.equal(options.groupChatLogTimeZone, "Asia/Shanghai");
     assert.equal(options.groupChatLogMaxTextLength, 2000);
     assert.equal(options.groupChatLogIncludeRawMessage, false);
-    assert.equal(options.groupMentionMediaTtlMs, 24 * 60 * 60 * 1000);
+    assert.equal(options.groupMentionMediaTtlMs, 5 * 60 * 1000);
     assert.equal(options.groupToolTargetPolicy, "force-current-group");
     assert.equal(options.imageFailureFallback, "upload-file");
     assert.equal(options.imageFailureFallbackNotice, false);
